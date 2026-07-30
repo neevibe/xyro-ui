@@ -278,6 +278,9 @@ const STATES = {
   speaking:  { amp:0.26, speed:0.7,  bloom:0.78, cA:'#38e6ff', cB:'#8affff', ringSpin:2,     scale:1.03 },
 };
 let state='dormant', target=STATES.dormant, awake=false;
+let rec=null, recWanted=true; // speech recognition instance + "should auto-restart" flag
+let queryBuffer='', querySilenceTimer=null;
+const QUERY_SILENCE_MS=1100; // pause length that finalizes a spoken query
 const cur = { amp:0.06, speed:0.12, bloom:0.16, ringSpin:0.28, scale:0.6 };
 const cA=new THREE.Color('#38e6ff'), cB=new THREE.Color('#7a5cff');
 const tA=new THREE.Color('#38e6ff'), tB=new THREE.Color('#7a5cff');
@@ -309,6 +312,21 @@ const greetEl = document.getElementById('greeting');
 const wakePrompt = document.getElementById('wakeprompt');
 
 const VOICE_BRIDGE = 'http://localhost:8788';
+const BRAIN_BRIDGE = 'http://localhost:8790';
+let brainUp = false;
+fetch(BRAIN_BRIDGE+'/health').then(r=>r.json()).then(()=>{ brainUp=true; console.log('XYRO brain bridge: up'); }).catch(()=>{});
+async function askBrain(text){
+  const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), 45000);
+  try {
+    const r = await fetch(BRAIN_BRIDGE+'/ask', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({text}), signal:ctrl.signal });
+    const d = await r.json(); clearTimeout(t);
+    if(!d.ok) throw new Error(d.error||'brain error');
+    return d.reply;
+  } catch(e){
+    clearTimeout(t);
+    return "Hm — I couldn't reach my brain just now. Is the brain bridge running?";
+  }
+}
 let bridgeUp = false;
 fetch(VOICE_BRIDGE+'/health').then(r=>r.json()).then(d=>{ bridgeUp=d.ok;
   if(bridgeUp) console.log('XYRO voice bridge:', d.engine);
@@ -337,21 +355,57 @@ function speak(text){
 }
 
 let waking=false;
+let sleepTimer=null;
+const AUTO_SLEEP_MS = 90000; // dormant again after 90s of no conversation
+
+function resetSleepTimer(){
+  clearTimeout(sleepTimer);
+  sleepTimer = setTimeout(sleep, AUTO_SLEEP_MS);
+}
+
+function showCaption(text, ms){
+  greetEl.textContent = text; greetEl.classList.add('show');
+  clearTimeout(showCaption._t);
+  if(ms) showCaption._t = setTimeout(()=>greetEl.classList.remove('show'), ms);
+}
+
+async function conversationTurn(userText){
+  setState('thinking');
+  const reply = await askBrain(userText);
+  if(!awake) return; // went to sleep while thinking
+  setState('speaking');
+  showCaption(reply, null);
+  speak(reply);
+  // rough speaking-duration estimate (bridge doesn't report playback end yet)
+  const words = reply.trim().split(/\s+/).length;
+  const speakMs = Math.max(1400, Math.min(14000, words*340));
+  setTimeout(()=>{ if(awake){ greetEl.classList.remove('show'); enterListening(); } }, speakMs);
+}
+
+function enterListening(){
+  if(!awake) return;
+  setState('listening');
+  resetSleepTimer();
+  try { rec && rec.start(); } catch(e){} // already-started errors are harmless
+}
+
+let waketimeout=null;
 function wake(source){
   if(awake) return; awake=true; waking=true;
   wakePrompt.classList.add('hidden');
   uniforms.uPulse.value = 1.6;
-  // wake burst
   flash.animate([{opacity:0},{opacity:.9,offset:.15},{opacity:0}], {duration:1200, easing:'cubic-bezier(.2,.7,.2,1)'});
-  setState('listening');
-  // witty greeting
+  setState('listening'); // brief acknowledgement pose while greeting plays
   const line = GREETINGS[greetIdx++ % GREETINGS.length];
-  setTimeout(()=>{ greetEl.textContent = line; greetEl.classList.add('show'); speak(line); }, 400);
-  setTimeout(()=>{ setState('idle'); }, 3200);
-  setTimeout(()=>{ greetEl.classList.remove('show'); }, 6500);
+  waketimeout = setTimeout(()=>{ showCaption(line, 3200); speak(line); }, 400);
+  setTimeout(()=>{ waking=false; enterListening(); }, 2600);
 }
 function sleep(){
-  awake=false; waking=false; setState('dormant');
+  clearTimeout(sleepTimer); clearTimeout(waketimeout);
+  awake=false; waking=false; queryBuffer=''; clearTimeout(querySilenceTimer);
+  // dormant still wants the wake-word listener running — don't stop rec here
+  recWanted=true; try{ rec && rec.start(); }catch(e){}
+  setState('dormant');
   greetEl.classList.remove('show'); wakePrompt.classList.remove('hidden');
 }
 
@@ -427,24 +481,46 @@ async function initAudio(){
   } catch(e){
     document.getElementById('wakeprompt').innerHTML = '👆 click the orb &nbsp;or&nbsp; press Space &nbsp;to wake<br><span>(enable mic to clap / say “Hello Xyro”)</span>';
   }
-  // wake word
+  // wake word (dormant) + real query capture (once awake & listening)
   const SR = window.SpeechRecognition||window.webkitSpeechRecognition;
   if(SR){
     try {
-      const rec=new SR(); rec.continuous=true; rec.interimResults=true; rec.lang='en-US';
+      rec=new SR(); rec.continuous=true; rec.interimResults=true; rec.lang='en-US';
       rec.onresult=(e)=>{
-        const txt=Array.from(e.results).map(r=>r[0].transcript).join(' ').toLowerCase();
-        if(!awake && /(xyro|zyro|zero|hero|cairo|xero|zaira)/.test(txt)) wake('voice');
+        const txt=Array.from(e.results).map(r=>r[0].transcript).join(' ').trim();
+        if(!awake){
+          if(/(xyro|zyro|zero|hero|cairo|xero|zaira)/i.test(txt)) wake('voice');
+          return;
+        }
+        if(state!=='listening') return; // ignore stray results while thinking/speaking
+        queryBuffer = txt;
+        resetSleepTimer();
+        clearTimeout(querySilenceTimer);
+        querySilenceTimer = setTimeout(finalizeQuery, QUERY_SILENCE_MS);
       };
-      rec.onend=()=>{ try{ rec.start(); }catch(e){} };
+      rec.onend=()=>{ if(recWanted){ try{ rec.start(); }catch(e){} } };
       rec.start();
     } catch(e){}
   }
+}
+function finalizeQuery(){
+  const text = queryBuffer.trim(); queryBuffer='';
+  if(text.length<2) return;
+  recWanted=false; try{ rec && rec.stop(); }catch(e){}
+  conversationTurn(text);
 }
 addEventListener('pointerdown', initAudio, { once:true });
 addEventListener('keydown', initAudio, { once:true });
 
 setState('dormant'); tick();
+
+// Debug/test hooks — lets you drive wake/query/sleep without a live mic
+// (devtools: XYRO.wake(), XYRO.say("..."), XYRO.sleep())
+window.XYRO = {
+  wake, sleep, speak, askBrain,
+  say: (text)=>{ if(!awake) wake('debug'); setTimeout(()=>{ queryBuffer=text; finalizeQuery(); }, awake?0:2700); },
+  state: ()=>state, isAwake: ()=>awake,
+};
 </script>
 </body>
 </html>
