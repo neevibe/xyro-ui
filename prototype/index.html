@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>XYRO Core</title>
+<style>
+  :root { --bg:#020203; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { height:100%; background:var(--bg); overflow:hidden; cursor:none; }
+  canvas { display:block; }
+  #ui {
+    position:fixed; inset:0; pointer-events:none;
+    font-family:-apple-system,"SF Pro Display",Inter,system-ui,sans-serif;
+    color:#eaf6ff;
+  }
+  .wordmark {
+    position:absolute; top:38px; left:50%; transform:translateX(-50%);
+    font-weight:600; letter-spacing:.62em; font-size:13px;
+    color:rgba(180,220,255,.55); text-indent:.62em;
+    opacity:0; animation:fade 1.4s 1.2s forwards;
+  }
+  .tagline {
+    position:absolute; bottom:118px; left:50%; transform:translateX(-50%);
+    font-weight:300; letter-spacing:.28em; font-size:11px;
+    color:rgba(150,190,225,.4); text-transform:uppercase; text-indent:.28em;
+    opacity:0; animation:fade 1.6s 1.8s forwards; white-space:nowrap;
+  }
+  #state-label {
+    position:absolute; top:50%; left:50%;
+    transform:translate(-50%,-50%) translateY(-190px);
+    font-weight:300; letter-spacing:.34em; font-size:10.5px; text-transform:uppercase;
+    color:rgba(120,235,255,.72); text-indent:.34em;
+    transition:opacity .5s, color .6s;
+  }
+  #dock {
+    position:absolute; bottom:46px; left:50%; transform:translateX(-50%);
+    display:flex; gap:10px; pointer-events:auto;
+    opacity:0; animation:fade 1.2s 2.2s forwards;
+  }
+  .chip {
+    font:500 11px/1 -apple-system,Inter,sans-serif; letter-spacing:.12em;
+    text-transform:uppercase; color:rgba(200,225,245,.6);
+    padding:11px 18px; border-radius:100px; cursor:pointer;
+    background:rgba(255,255,255,.03);
+    border:1px solid rgba(140,190,235,.14);
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    transition:.35s cubic-bezier(.2,.8,.2,1);
+  }
+  .chip:hover { color:#eaf9ff; border-color:rgba(120,220,255,.5);
+    background:rgba(90,180,255,.09); transform:translateY(-2px); }
+  .chip.active { color:#eafcff; border-color:rgba(120,225,255,.7);
+    background:rgba(80,190,255,.14); box-shadow:0 0 26px rgba(70,190,255,.25); }
+  #cursor {
+    position:fixed; width:26px; height:26px; border-radius:50%; pointer-events:none;
+    margin:-13px 0 0 -13px; z-index:50; mix-blend-mode:screen;
+    background:radial-gradient(circle, rgba(130,225,255,.9) 0%, rgba(120,180,255,.25) 45%, transparent 70%);
+    transition:width .3s, height .3s, opacity .3s;
+  }
+  @keyframes fade { to { opacity:1; } }
+  #hint { position:absolute; bottom:20px; left:50%; transform:translateX(-50%);
+    font:300 10px/1 Inter,sans-serif; letter-spacing:.18em; color:rgba(120,150,180,.35);
+    text-transform:uppercase; opacity:0; animation:fade 2s 3s forwards; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div class="wordmark">X Y R O</div>
+  <div id="state-label">Idle</div>
+  <div class="tagline">The official AI companion of Xyrenis</div>
+  <div id="dock">
+    <div class="chip active" data-state="idle">Idle</div>
+    <div class="chip" data-state="listening">Listening</div>
+    <div class="chip" data-state="thinking">Thinking</div>
+    <div class="chip" data-state="speaking">Speaking</div>
+  </div>
+  <div id="hint">move cursor · orb reacts</div>
+</div>
+<div id="cursor"></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://esm.sh/three@0.160.0",
+  "three/addons/": "https://esm.sh/three@0.160.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+
+const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x020203, 0.055);
+const camera = new THREE.PerspectiveCamera(42, innerWidth/innerHeight, 0.1, 100);
+camera.position.set(0, 0, 6.2);
+
+const rig = new THREE.Group(); scene.add(rig); // parallax rig
+
+// ---- shared GLSL noise (Ashima simplex 3D) ----
+const NOISE = `
+vec4 permute(vec4 x){return mod(((x*34.0)+1.0)*x,289.0);}
+vec4 taylorInvSqrt(vec4 r){return 1.79284291400159-0.85373472095314*r;}
+float snoise(vec3 v){
+  const vec2 C=vec2(1.0/6.0,1.0/3.0); const vec4 D=vec4(0.0,0.5,1.0,2.0);
+  vec3 i=floor(v+dot(v,C.yyy)); vec3 x0=v-i+dot(i,C.xxx);
+  vec3 g=step(x0.yzx,x0.xyz); vec3 l=1.0-g; vec3 i1=min(g.xyz,l.zxy); vec3 i2=max(g.xyz,l.zxy);
+  vec3 x1=x0-i1+1.0*C.xxx; vec3 x2=x0-i2+2.0*C.xxx; vec3 x3=x0-1.0+3.0*C.xxx;
+  i=mod(i,289.0);
+  vec4 p=permute(permute(permute(i.z+vec4(0.0,i1.z,i2.z,1.0))+i.y+vec4(0.0,i1.y,i2.y,1.0))+i.x+vec4(0.0,i1.x,i2.x,1.0));
+  float n_=1.0/7.0; vec3 ns=n_*D.wyz-D.xzx;
+  vec4 j=p-49.0*floor(p*ns.z*ns.z);
+  vec4 x_=floor(j*ns.z); vec4 y_=floor(j-7.0*x_);
+  vec4 x=x_*ns.x+ns.yyyy; vec4 y=y_*ns.x+ns.yyyy; vec4 h=1.0-abs(x)-abs(y);
+  vec4 b0=vec4(x.xy,y.xy); vec4 b1=vec4(x.zw,y.zw);
+  vec4 s0=floor(b0)*2.0+1.0; vec4 s1=floor(b1)*2.0+1.0; vec4 sh=-step(h,vec4(0.0));
+  vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy; vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+  vec3 p0=vec3(a0.xy,h.x); vec3 p1=vec3(a0.zw,h.y); vec3 p2=vec3(a1.xy,h.z); vec3 p3=vec3(a1.zw,h.w);
+  vec4 norm=taylorInvSqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+  p0*=norm.x; p1*=norm.y; p2*=norm.z; p3*=norm.w;
+  vec4 m=max(0.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.0); m=m*m;
+  return 42.0*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+}
+float fbm(vec3 p){ float f=0.0,a=0.5; for(int i=0;i<5;i++){ f+=a*snoise(p); p*=2.02; a*=0.5;} return f; }
+`;
+
+const uniforms = {
+  uTime:{value:0}, uState:{value:0}, uAmp:{value:0.16}, uSpeed:{value:0.35},
+  uPulse:{value:0}, uColorA:{value:new THREE.Color('#38e6ff')},
+  uColorB:{value:new THREE.Color('#7a5cff')}, uColorC:{value:new THREE.Color('#39ffb0')},
+};
+
+// ---- energy core (displaced icosahedron) ----
+const coreMat = new THREE.ShaderMaterial({
+  uniforms, transparent:true,
+  vertexShader:`
+    ${NOISE}
+    uniform float uTime,uAmp,uSpeed,uPulse;
+    varying float vN; varying vec3 vPos; varying vec3 vNormal;
+    void main(){
+      vNormal = normal;
+      float t = uTime*uSpeed;
+      float n = fbm(normal*1.7 + vec3(t*0.6));
+      float ripple = snoise(normal*4.0 + vec3(t*1.4)) * 0.35;
+      float disp = (n + ripple) * uAmp + uPulse*0.22*sin(uTime*7.0 + n*4.0);
+      vN = n;
+      vec3 p = position + normal*disp;
+      vPos = p;
+      gl_Position = projectionMatrix*modelViewMatrix*vec4(p,1.0);
+    }`,
+  fragmentShader:`
+    uniform float uTime; uniform vec3 uColorA,uColorB,uColorC; uniform float uState;
+    varying float vN; varying vec3 vPos; varying vec3 vNormal;
+    void main(){
+      vec3 vd = normalize(cameraPosition - vPos);
+      float fres = pow(1.0 - max(dot(vd, normalize(vNormal)),0.0), 2.6);
+      float bands = 0.5 + 0.5*sin(vN*6.0 + uTime*1.4);
+      vec3 col = mix(uColorB, uColorA, bands);
+      col = mix(col, uColorC, smoothstep(0.4,1.0,vN)*0.4);
+      float core = smoothstep(0.1,-0.5,vN)*0.35; // hot inner
+      vec3 emit = col*(0.18+bands*0.28) + col*fres*1.15 + vec3(0.55,0.85,1.0)*core;
+      float alpha = 0.14 + fres*0.6 + core*0.3;
+      gl_FragColor = vec4(emit, alpha);
+    }`,
+});
+const core = new THREE.Mesh(new THREE.IcosahedronGeometry(1.32, 128), coreMat);
+core.material.blending = THREE.AdditiveBlending; core.material.depthWrite=false;
+rig.add(core);
+
+// inner solid nucleus for density
+const nucleus = new THREE.Mesh(
+  new THREE.IcosahedronGeometry(1.02, 64),
+  new THREE.ShaderMaterial({ uniforms, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false,
+    vertexShader:`${NOISE} uniform float uTime,uSpeed; varying float vN;
+      void main(){ float n=fbm(normal*2.2+vec3(uTime*uSpeed*0.8)); vN=n;
+      vec3 p=position+normal*n*0.06; gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.0);}`,
+    fragmentShader:`uniform vec3 uColorA,uColorB; varying float vN;
+      void main(){ vec3 c=mix(uColorB,uColorA,0.5+0.5*vN); gl_FragColor=vec4(c*0.6,0.22*smoothstep(-0.3,0.6,vN));}`,
+  })
+);
+rig.add(nucleus);
+
+// ---- magnetic field rings ----
+const rings = new THREE.Group(); rig.add(rings);
+for(let i=0;i<3;i++){
+  const r = new THREE.Mesh(
+    new THREE.TorusGeometry(1.9+i*0.28, 0.006, 8, 220),
+    new THREE.MeshBasicMaterial({ color: i%2? 0x7a5cff:0x38e6ff, transparent:true, opacity:0.32, blending:THREE.AdditiveBlending, depthWrite:false })
+  );
+  r.rotation.x = Math.PI*0.5 + (i-1)*0.42; r.rotation.y = i*0.6;
+  r.userData.sx = 0.13+i*0.05; r.userData.sz = 0.09-i*0.03;
+  rings.add(r);
+}
+
+// ---- neural particle field ----
+const COUNT = 2600;
+const pos = new Float32Array(COUNT*3), rand = new Float32Array(COUNT);
+for(let i=0;i<COUNT;i++){
+  const r = 1.7 + Math.pow(Math.random(),1.5)*3.4;
+  const th = Math.random()*Math.PI*2, ph = Math.acos(2*Math.random()-1);
+  pos[i*3]=r*Math.sin(ph)*Math.cos(th); pos[i*3+1]=r*Math.sin(ph)*Math.sin(th); pos[i*3+2]=r*Math.cos(ph);
+  rand[i]=Math.random();
+}
+const pg = new THREE.BufferGeometry();
+pg.setAttribute('position', new THREE.BufferAttribute(pos,3));
+pg.setAttribute('aRand', new THREE.BufferAttribute(rand,1));
+const particles = new THREE.Points(pg, new THREE.ShaderMaterial({
+  uniforms, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false,
+  vertexShader:`${NOISE} uniform float uTime,uState,uSpeed; attribute float aRand; varying float vA;
+    void main(){
+      vec3 p=position;
+      float t=uTime*(0.15+uState*0.25);
+      float sw=fbm(p*0.4+vec3(t)); p+=normalize(p)*sw*0.25*(0.5+uState);
+      float ang=t*(0.2+aRand*0.4)*(1.0+uState*1.5);
+      mat2 R=mat2(cos(ang),-sin(ang),sin(ang),cos(ang)); p.xz=R*p.xz;
+      vec4 mv=modelViewMatrix*vec4(p,1.0);
+      float d=length(position);
+      vA=(1.0-smoothstep(2.2,5.2,d))*(0.25+0.4*aRand);
+      gl_PointSize=clamp((0.6+aRand*1.3)*(1.0+uState*0.6)*(120.0/-mv.z), 1.0, 9.0);
+      gl_Position=projectionMatrix*mv;
+    }`,
+  fragmentShader:`uniform vec3 uColorA,uColorC; uniform float uState; varying float vA;
+    void main(){ vec2 c=gl_PointCoord-0.5; float d=length(c); if(d>0.5)discard;
+      float g=smoothstep(0.5,0.0,d); vec3 col=mix(uColorA,uColorC,uState*0.5);
+      gl_FragColor=vec4(col, g*vA*0.55); }`,
+}));
+rig.add(particles);
+
+// starfield backdrop
+const sCount=900, sp=new Float32Array(sCount*3);
+for(let i=0;i<sCount;i++){ sp[i*3]=(Math.random()-0.5)*40; sp[i*3+1]=(Math.random()-0.5)*40; sp[i*3+2]=(Math.random()-0.5)*40-8; }
+const sg=new THREE.BufferGeometry(); sg.setAttribute('position',new THREE.BufferAttribute(sp,3));
+scene.add(new THREE.Points(sg, new THREE.PointsMaterial({ color:0x6a8bb5, size:0.02, transparent:true, opacity:0.5 })));
+
+// ---- postprocessing: bloom ----
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight), 0.6, 0.55, 0.72);
+composer.addPass(bloom);
+// vignette
+composer.addPass(new ShaderPass({
+  uniforms:{ tDiffuse:{value:null} },
+  vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
+  fragmentShader:`uniform sampler2D tDiffuse; varying vec2 vUv;
+    void main(){ vec4 c=texture2D(tDiffuse,vUv); float d=distance(vUv,vec2(0.5));
+      c.rgb*=smoothstep(0.95,0.35,d); gl_FragColor=c; }`,
+}));
+
+// ---- state machine ----
+const STATES = {
+  idle:      { amp:0.14, speed:0.30, bloom:0.5,  cA:'#38e6ff', cB:'#7a5cff', ringSpin:1 },
+  listening: { amp:0.30, speed:0.55, bloom:0.72, cA:'#39ffb0', cB:'#38e6ff', ringSpin:1.6 },
+  thinking:  { amp:0.22, speed:1.35, bloom:0.85, cA:'#7a5cff', cB:'#38e6ff', ringSpin:3.4 },
+  speaking:  { amp:0.26, speed:0.7,  bloom:0.78, cA:'#38e6ff', cB:'#8affff', ringSpin:2 },
+};
+let state='idle', target=STATES.idle;
+const cur = { amp:0.14, speed:0.3, bloom:0.5, ringSpin:1 };
+const cA=new THREE.Color('#38e6ff'), cB=new THREE.Color('#7a5cff');
+const tA=new THREE.Color('#38e6ff'), tB=new THREE.Color('#7a5cff');
+function setState(s){
+  state=s; target=STATES[s];
+  tA.set(target.cA); tB.set(target.cB);
+  document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('active',c.dataset.state===s));
+  const lbl=document.getElementById('state-label'); lbl.textContent=s[0].toUpperCase()+s.slice(1);
+  lbl.style.color = s==='thinking'?'rgba(150,140,255,.8)': s==='listening'?'rgba(90,255,190,.8)':'rgba(120,235,255,.75)';
+}
+document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>setState(c.dataset.state)));
+// auto-cycle a gentle demo if untouched
+let lastInteract=performance.now();
+['click','pointermove'].forEach(e=>addEventListener(e,()=>lastInteract=performance.now()));
+
+// ---- cursor parallax + custom cursor ----
+const cursorEl=document.getElementById('cursor');
+const ptr={x:0,y:0}, ptrT={x:0,y:0};
+addEventListener('pointermove',e=>{
+  ptrT.x=(e.clientX/innerWidth-0.5); ptrT.y=(e.clientY/innerHeight-0.5);
+  cursorEl.style.left=e.clientX+'px'; cursorEl.style.top=e.clientY+'px';
+});
+addEventListener('pointerdown',()=>{ uniforms.uPulse.value=1; cursorEl.style.width='40px'; cursorEl.style.height='40px'; });
+addEventListener('pointerup',()=>{ cursorEl.style.width='26px'; cursorEl.style.height='26px'; });
+
+// ---- loop ----
+const clock=new THREE.Clock();
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight); composer.setSize(innerWidth,innerHeight);
+});
+function tick(){
+  const dt=clock.getDelta(), t=clock.elapsedTime;
+  uniforms.uTime.value=t;
+  // ease state
+  const k=1-Math.pow(0.002,dt);
+  cur.amp+=(target.amp-cur.amp)*k; cur.speed+=(target.speed-cur.speed)*k;
+  cur.bloom+=(target.bloom-cur.bloom)*k; cur.ringSpin+=(target.ringSpin-cur.ringSpin)*k;
+  cA.lerp(tA,k); cB.lerp(tB,k);
+  const breathe=1+Math.sin(t*1.1)*0.03*(state==='idle'?1:0.4);
+  uniforms.uAmp.value=cur.amp*breathe; uniforms.uSpeed.value=cur.speed;
+  uniforms.uColorA.value.copy(cA); uniforms.uColorB.value.copy(cB);
+  uniforms.uState.value = state==='idle'?0: state==='thinking'?1: 0.6;
+  uniforms.uPulse.value*=0.92;
+  bloom.strength=cur.bloom;
+  core.scale.setScalar(breathe); nucleus.scale.setScalar(breathe);
+  rings.children.forEach((r,i)=>{ r.rotation.z+=dt*r.userData.sx*cur.ringSpin; r.rotation.y+=dt*r.userData.sz*cur.ringSpin; });
+  particles.rotation.y+=dt*0.03;
+  // parallax
+  ptr.x+=(ptrT.x-ptr.x)*0.05; ptr.y+=(ptrT.y-ptr.y)*0.05;
+  rig.rotation.y = ptr.x*0.6; rig.rotation.x = ptr.y*0.4;
+  camera.position.x = ptr.x*0.8; camera.position.y = -ptr.y*0.6; camera.lookAt(0,0,0);
+  // idle auto-demo: subtle pulse every ~6s if idle & untouched
+  if(performance.now()-lastInteract>8000 && Math.sin(t*0.3)>0.999) uniforms.uPulse.value=0.6;
+  composer.render();
+  requestAnimationFrame(tick);
+}
+setState('idle'); tick();
+</script>
+</body>
+</html>
