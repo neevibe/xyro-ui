@@ -735,9 +735,27 @@ let turnCount = 0;
 
 // Named (not inline) so it can also be driven directly for testing via
 // window.XYRO.simulateSpeech — real mic input can't be faked remotely.
+// Standalone stop/cancel commands — checked BEFORE barge-in. Without this,
+// saying "stop" correctly cut the audio (barge-in) but then got forwarded to
+// the brain as if it were a real question, which asked something back and
+// started talking again — indistinguishable from "it doesn't listen".
+const STOP_COMMAND = /^(xyro,?\s*|hey xyro,?\s*)?(stop|cancel|quiet|shut up|that'?s enough|okay stop|please stop|wait,?\s*stop|never ?mind|enough)\.?\s*$/i;
+
 function handleSpeechResult(txt){
   if(!awake){
     if(/(xyro|xylo|zyro|zylo|zero|hero|cairo|xero|zaira|silo)/i.test(txt)) wake('voice');
+    return;
+  }
+  if(STOP_COMMAND.test(txt.trim())){
+    // Silence immediately, stay awake, and — critically — never forward this
+    // to the brain as a question. No confirmation, no delay.
+    currentTurnId++;
+    stopSpeaking();
+    queryBuffer = '';
+    clearTimeout(querySilenceTimer);
+    hideGreetingPanel();
+    setState('listening');
+    resetSleepTimer();
     return;
   }
   if(state==='thinking' || state==='speaking'){
