@@ -493,26 +493,35 @@ function makeTypewriter(el, wordsPerSec = 13){
 }
 const xyroTypewriter = makeTypewriter(greetEl);
 
+// Bumped whenever a NEW turn starts (including a barge-in interrupting an
+// old one). A running conversationTurn checks this before every side effect
+// so an interrupted reply's leftover stream can't keep feeding speech/
+// captions after the user has already moved on to a new question.
+let currentTurnId = 0;
+
 async function conversationTurn(userText){
+  const myTurn = ++currentTurnId;
+  const stale = () => myTurn !== currentTurnId;
   setState('thinking');
   xyroTypewriter.reset();
   showGreetingPanel();
   let firstDelta = true;
   const pipeliner = makeSentencePipeliner((sentence)=>{
-    if(awake) speak(sentence); // queued on the bridge — plays in order
+    if(awake && !stale()) speak(sentence); // queued on the bridge — plays in order
   });
   const full = await askBrainStream(userText, (delta)=>{
-    if(!awake) return;
+    if(!awake || stale()) return;
     if(firstDelta){ firstDelta=false; setState('speaking'); }
     xyroTypewriter.feed(delta); // robotic word-by-word reveal, paced independent of network chunking
     pipeliner.feed(delta);
   });
+  if(stale()) return; // superseded by a barge-in — this turn's work is done
   xyroTypewriter.end();
   pipeliner.flush();
   if(!awake) return;
   const words = full.trim().split(/\s+/).length;
   const speakMs = Math.max(1200, Math.min(16000, words*300));
-  setTimeout(()=>{ if(awake){ hideGreetingPanel(); enterListening(); } }, speakMs);
+  setTimeout(()=>{ if(awake && !stale()){ hideGreetingPanel(); enterListening(); } }, speakMs);
 }
 
 function enterListening(){
@@ -631,19 +640,7 @@ async function initAudio(){
   if(SR){
     try {
       rec=new SR(); rec.continuous=true; rec.interimResults=true; rec.lang='en-US';
-      rec.onresult=(e)=>{
-        const txt=Array.from(e.results).map(r=>r[0].transcript).join(' ').trim();
-        if(!awake){
-          if(/(xyro|zyro|zero|hero|cairo|xero|zaira)/i.test(txt)) wake('voice');
-          return;
-        }
-        if(state!=='listening') return; // ignore stray results while thinking/speaking
-        queryBuffer = txt;
-        if(txt) showCaption(txt, null); // live caption of what you're saying, as you say it
-        resetSleepTimer();
-        clearTimeout(querySilenceTimer);
-        querySilenceTimer = setTimeout(finalizeQuery, QUERY_SILENCE_MS);
-      };
+      rec.onresult=(e)=>handleSpeechResult(Array.from(e.results).map(r=>r[0].transcript).join(' ').trim());
       rec.onend=()=>{ if(recWanted){ try{ rec.start(); }catch(e){} } };
       rec.start();
     } catch(e){}
@@ -683,6 +680,37 @@ function isSignOff(raw, isFirstTurn){
 const SIGNOFF_LINES = ["Going quiet. Ping me when you need me.","Anytime.","Catch you later.","I'll be here."];
 let turnCount = 0;
 
+// Named (not inline) so it can also be driven directly for testing via
+// window.XYRO.simulateSpeech — real mic input can't be faked remotely.
+function handleSpeechResult(txt){
+  if(!awake){
+    if(/(xyro|zyro|zero|hero|cairo|xero|zaira)/i.test(txt)) wake('voice');
+    return;
+  }
+  if(state==='thinking' || state==='speaking'){
+    // Barge-in: real speech while Xyro is talking/thinking means "stop and
+    // listen to me" — the fix for "it keeps talking when I ask it to stop".
+    // Ignore tiny noise blips, but anything substantive cuts playback
+    // immediately and starts capturing the new query.
+    if(txt.replace(/[^a-z0-9]/gi,'').length < 3) return;
+    currentTurnId++; // cancels the in-flight reply's remaining side effects
+    stopSpeaking();  // clears the queued/current audio on the voice bridge
+    setState('listening');
+    queryBuffer = txt;
+    showCaption(txt, null);
+    resetSleepTimer();
+    clearTimeout(querySilenceTimer);
+    querySilenceTimer = setTimeout(finalizeQuery, QUERY_SILENCE_MS);
+    return;
+  }
+  if(state!=='listening') return; // ignore stray results otherwise (e.g. mid-transition)
+  queryBuffer = txt;
+  if(txt) showCaption(txt, null); // live caption of what you're saying, as you say it
+  resetSleepTimer();
+  clearTimeout(querySilenceTimer);
+  querySilenceTimer = setTimeout(finalizeQuery, QUERY_SILENCE_MS);
+}
+
 function finalizeQuery(){
   const text = queryBuffer.trim(); queryBuffer='';
   if(text.length<2) return;
@@ -706,7 +734,7 @@ setState('dormant'); tick();
 // Debug/test hooks — lets you drive wake/query/sleep without a live mic
 // (devtools: XYRO.wake(), XYRO.say("..."), XYRO.sleep())
 window.XYRO = {
-  wake, sleep, speak, askBrainStream,
+  wake, sleep, speak, askBrainStream, simulateSpeech: handleSpeechResult, setState,
   say: (text)=>{ if(!awake) wake('debug'); setTimeout(()=>{ queryBuffer=text; finalizeQuery(); }, awake?0:2700); },
   state: ()=>state, isAwake: ()=>awake,
 };
