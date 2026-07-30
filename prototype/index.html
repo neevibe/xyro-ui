@@ -642,12 +642,24 @@ function enterListening(){
 }
 
 let waketimeout=null;
-function wake(source){
+function wake(source, opts){
   if(awake) return; awake=true; waking=true;
   wakePrompt.classList.add('hidden');
   uniforms.uPulse.value = 1.6;
   flash.animate([{opacity:0},{opacity:.9,offset:.15},{opacity:0}], {duration:1200, easing:'cubic-bezier(.2,.7,.2,1)'});
   setState('listening'); // brief acknowledgement pose while greeting plays
+  if(opts && opts.silent){
+    // A real query arrived bundled with the wake phrase itself (e.g. "Hello
+    // Xyro, what's my flagship project") — skip the canned greeting. It used
+    // to fire on a fixed timer regardless, which collided head-on with the
+    // real conversationTurn about to run: the greeting would overwrite the
+    // real reply's caption mid-stream, then a second timer forced state back
+    // to 'listening' while the real answer might still be talking. That
+    // collision was the actual cause of "goes silent / works inconsistently".
+    // conversationTurn owns all state transitions from here.
+    waking=false;
+    return;
+  }
   const line = GREETINGS[greetIdx++ % GREETINGS.length];
   waketimeout = setTimeout(()=>{
     xyroTypewriter.reset(); showGreetingPanel(); xyroTypewriter.feed(line); xyroTypewriter.end();
@@ -743,9 +755,9 @@ async function initAudio(){
       let sum=0; for(let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; sum+=v*v; }
       const rms=Math.sqrt(sum/buf.length);
       cooldown=Math.max(0,cooldown-1);
-      // clap = sharp loud transient after relative quiet — loosened from the
-      // original threshold, which required an unrealistically hard clap
-      if(!awake && cooldown===0 && rms>0.12 && rms-prevRms>0.06){ cooldown=30; wake('clap'); }
+      // clap = sharp loud transient after relative quiet — tuned threshold so
+      // normal/soft claps wake the orb instantly
+      if(!awake && cooldown===0 && rms>0.04 && (rms-prevRms)>0.02){ cooldown=30; wake('clap'); }
       prevRms=prevRms*0.6+rms*0.4;
     }, 20);
     const porcupineActive = await initWakeWordEngine(() => { if(!awake) wake('porcupine'); });
@@ -812,9 +824,28 @@ let turnCount = 0;
 // started talking again — indistinguishable from "it doesn't listen".
 const STOP_COMMAND = /^(xyro,?\s*|hey xyro,?\s*)?(stop|cancel|quiet|shut up|that'?s enough|okay stop|please stop|wait,?\s*stop|never ?mind|enough)\.?\s*$/i;
 
+const WAKE_WORD_PATTERN = /(xyro|xylo|zyro|zylo|zero|hero|cairo|xero|zaira|silo|xyra|zira|xiro|sero|syro|tyro|xeyro|zara|sira|jarvis|hello|hey|arey|ari|hi|ok|okay)/i;
+
 function handleSpeechResult(txt){
   if(!awake){
-    if(/(xyro|xylo|zyro|zylo|zero|hero|cairo|xero|zaira|silo)/i.test(txt)) wake('voice');
+    if(WAKE_WORD_PATTERN.test(txt)){
+      // If a real query rode along with the wake word/greeting (e.g. "Hello
+      // Xyro, can you write an email"), extract it and answer directly —
+      // decide THIS before calling wake(), so wake() knows whether to play
+      // its canned greeting (bare wake word) or skip straight to answering
+      // (real query attached). Deciding after would be too late: wake()
+      // schedules its greeting timers synchronously.
+      const clean = txt
+        .replace(/^(hello|hey|arey|ari|hi|ok|okay|,|\s)*(xyro|xylo|zyro|zylo|zero|hero|cairo|xero|zaira|silo|xyra|zira|xiro|sero|syro|tyro|xeyro|zara|sira|jarvis)?\s*/i, '')
+        .trim();
+      if(clean.length >= 2){
+        wake('voice', {silent:true});
+        queryBuffer = clean;
+        setTimeout(finalizeQuery, 500);
+      } else {
+        wake('voice');
+      }
+    }
     return;
   }
   if(STOP_COMMAND.test(txt.trim())){
