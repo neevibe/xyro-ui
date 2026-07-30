@@ -114,7 +114,9 @@
 <script type="importmap">
 { "imports": {
   "three": "https://esm.sh/three@0.160.0",
-  "three/addons/": "https://esm.sh/three@0.160.0/examples/jsm/"
+  "three/addons/": "https://esm.sh/three@0.160.0/examples/jsm/",
+  "@picovoice/porcupine-web": "https://esm.sh/@picovoice/porcupine-web@3",
+  "@picovoice/web-voice-processor": "https://esm.sh/@picovoice/web-voice-processor@4"
 }}
 </script>
 
@@ -124,6 +126,50 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { PorcupineWorker } from '@picovoice/porcupine-web';
+import { WebVoiceProcessor } from '@picovoice/web-voice-processor';
+
+/**
+ * Wake-word config. The Web Speech "transcribe everything, regex-match it"
+ * approach is fundamentally the wrong tool for wake-word spotting — it's
+ * sentence-level dictation, not frame-level continuous listening, which is
+ * why activation was unreliable and slow. Porcupine is purpose-built for
+ * exactly this: a tiny model classifying audio frames continuously and
+ * locally (WASM, in a Web Worker — genuinely low-power), typically
+ * detecting a keyword in well under 300ms.
+ *
+ * "Xyro" isn't a built-in Porcupine keyword, so it needs a custom model —
+ * free, but requires a one-time setup only Neeraj can do (Picovoice account
+ * + training a keyword in their console). Until PICOVOICE_ACCESS_KEY and the
+ * two model files below are in place, this silently no-ops and the existing
+ * speech-recognition wake-word regex keeps working as the fallback — nothing
+ * breaks in the meantime.
+ */
+const PICOVOICE_ACCESS_KEY = ''; // paste your AccessKey from console.picovoice.ai
+const XYRO_KEYWORD_MODEL = 'xyro_keyword.ppn';      // downloaded from Picovoice Console
+const PORCUPINE_BASE_MODEL = 'porcupine_params.pv'; // downloaded from the Porcupine repo
+let porcupineWorker = null;
+
+async function initWakeWordEngine(onWake) {
+  if (!PICOVOICE_ACCESS_KEY) {
+    console.log('Porcupine wake-word engine not configured — using speech-recognition fallback. See README for setup.');
+    return false;
+  }
+  try {
+    porcupineWorker = await PorcupineWorker.create(
+      PICOVOICE_ACCESS_KEY,
+      [{ publicPath: XYRO_KEYWORD_MODEL, label: 'xyro' }],
+      () => onWake(),
+      { publicPath: PORCUPINE_BASE_MODEL },
+    );
+    await WebVoiceProcessor.subscribe(porcupineWorker);
+    console.log('Porcupine wake-word engine active — listening for "Xyro" locally.');
+    return true;
+  } catch (e) {
+    console.warn('Porcupine init failed, falling back to speech-recognition wake-word:', e.message);
+    return false;
+  }
+}
 
 // Graceful degradation: if WebGL is unavailable (sandboxed/headless browser,
 // ancient hardware, locked-down enterprise machine), fail visibly instead of
@@ -611,7 +657,11 @@ let audioReady=false;
 async function initAudio(){
   if(audioReady) return; audioReady=true;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:false } });
+    // Raw, unprocessed signal on purpose: echo cancellation and auto-gain are
+    // tuned for voice calls and actively suppress/renormalize sharp transient
+    // spikes — exactly what a clap is. Both were very likely eating the
+    // signal this detector needs to see clearly.
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:false, noiseSuppression:false, autoGainControl:false } });
     const ac = new (window.AudioContext||window.webkitAudioContext)();
     const src = ac.createMediaStreamSource(stream);
     const an = ac.createAnalyser(); an.fftSize=1024; src.connect(an);
@@ -631,7 +681,10 @@ async function initAudio(){
       if(!awake && cooldown===0 && rms>0.12 && rms-prevRms>0.06){ cooldown=30; wake('clap'); }
       prevRms=prevRms*0.6+rms*0.4;
     }, 20);
-    document.getElementById('wakeprompt').innerHTML = '👏 clap &nbsp;or&nbsp; 🎙 say “Hello Xyro” &nbsp;to wake<br><span>mic live · or click the orb</span>';
+    const porcupineActive = await initWakeWordEngine(() => { if(!awake) wake('porcupine'); });
+    document.getElementById('wakeprompt').innerHTML = porcupineActive
+      ? '👏 clap &nbsp;or&nbsp; 🎙 say “Xyro” &nbsp;to wake<br><span>mic live · wake-word engine active</span>'
+      : '👏 clap &nbsp;or&nbsp; 🎙 say “Hello Xyro” &nbsp;to wake<br><span>mic live · or click the orb</span>';
   } catch(e){
     document.getElementById('wakeprompt').innerHTML = '👆 click the orb &nbsp;or&nbsp; press Space &nbsp;to wake<br><span>(enable mic to clap / say “Hello Xyro”)</span>';
   }
@@ -684,7 +737,7 @@ let turnCount = 0;
 // window.XYRO.simulateSpeech — real mic input can't be faked remotely.
 function handleSpeechResult(txt){
   if(!awake){
-    if(/(xyro|zyro|zero|hero|cairo|xero|zaira)/i.test(txt)) wake('voice');
+    if(/(xyro|xylo|zyro|zylo|zero|hero|cairo|xero|zaira|silo)/i.test(txt)) wake('voice');
     return;
   }
   if(state==='thinking' || state==='speaking'){
