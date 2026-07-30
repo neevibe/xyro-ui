@@ -106,7 +106,19 @@ import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 
-const renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+// Graceful degradation: if WebGL is unavailable (sandboxed/headless browser,
+// ancient hardware, locked-down enterprise machine), fail visibly instead of
+// silently — an uncaught exception here previously killed the ENTIRE script,
+// including all click handlers and window.XYRO, with zero user feedback.
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:false });
+} catch (e) {
+  document.body.innerHTML = `<div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#020203;color:#8fb8d6;font:300 15px/1.6 -apple-system,Inter,sans-serif;text-align:center;padding:40px;">
+    XYRO needs WebGL, which this browser/device couldn't provide.<br>
+    <span style="color:rgba(150,190,225,.5);font-size:12px;">${(e && e.message) || 'Unknown WebGL error'}</span></div>`;
+  throw e; // still stop this script — but the page now explains why instead of going dead silently
+}
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
