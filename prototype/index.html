@@ -61,17 +61,36 @@
   #hint { position:absolute; bottom:20px; left:50%; transform:translateX(-50%);
     font:300 10px/1 Inter,sans-serif; letter-spacing:.18em; color:rgba(120,150,180,.35);
     text-transform:uppercase; opacity:0; animation:fade 2s 3s forwards; }
-  #greeting { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%) translateY(150px);
-    font:300 20px/1.4 -apple-system,"SF Pro Display",Inter,sans-serif; letter-spacing:.01em;
-    color:#eaf9ff; text-align:center; max-width:70vw; opacity:0;
-    text-shadow:0 0 30px rgba(90,200,255,.5); transition:opacity .8s; pointer-events:none; }
-  #greeting.show { opacity:1; }
+  #greeting { position:fixed; top:50%; right:36px; transform:translateY(-50%);
+    width:min(360px, 34vw); max-height:70vh; overflow-y:auto;
+    font:400 14.5px/1.65 "SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    letter-spacing:.01em; color:#c9f3ff; text-align:left; opacity:0;
+    padding:18px 20px; border-radius:14px; pointer-events:none;
+    background:rgba(6,14,20,.55); border:1px solid rgba(120,220,255,.16);
+    backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
+    box-shadow:0 0 40px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.02); }
+  #greeting .cursor { display:inline-block; width:8px; height:15px; margin-left:2px;
+    background:#7ef0ff; vertical-align:-2px; animation:blink 0.9s steps(1) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+  @media (max-width: 860px) {
+    #greeting { right:50%; transform:translate(50%, -50%); width:min(420px,86vw); }
+  }
   #wakeprompt { position:absolute; bottom:150px; left:50%; transform:translateX(-50%);
     font:400 13px/1.8 -apple-system,Inter,sans-serif; letter-spacing:.06em; text-align:center;
     color:rgba(180,215,245,.55); transition:opacity .6s; }
   #wakeprompt span { font-size:11px; color:rgba(150,185,220,.35); letter-spacing:.1em; }
   #wakeprompt.hidden { opacity:0; }
-  .flash { position:fixed; inset:0; pointer-events:none; z-index:40; opacity:0;
+  /* A fixed inset:0 div sized to the full (rectangular) viewport, combined with
+     radial-gradient's default farthest-corner sizing, makes the falloff
+     percentages relative to the DIAGONAL — so on any non-square window the
+     short-axis edges land only partway through the fade (still glowing) while
+     the long-axis edges are fully transparent. That asymmetric wash reads as
+     a rectangular flash, not a circular one. Fix: size the element itself to
+     a square based on the SMALLER viewport dimension (vmin), so the circle
+     drawn inside it always fades to transparent well before any edge — a
+     true circular pulse regardless of window shape. */
+  .flash { position:fixed; top:50%; left:50%; pointer-events:none; z-index:40; opacity:0;
+    width:130vmin; height:130vmin; transform:translate(-50%,-50%); border-radius:50%;
     background:radial-gradient(circle at 50% 50%, rgba(150,225,255,.55), rgba(120,180,255,.15) 35%, transparent 65%); }
 </style>
 </head>
@@ -419,30 +438,81 @@ function resetSleepTimer(){
   sleepTimer = setTimeout(sleep, AUTO_SLEEP_MS);
 }
 
-function showCaption(text, ms){
-  greetEl.textContent = text; greetEl.classList.add('show');
-  clearTimeout(showCaption._t);
-  if(ms) showCaption._t = setTimeout(()=>greetEl.classList.remove('show'), ms);
+// CSS `transition:opacity` on this element proved unreliable at triggering
+// on scripted class changes (verified empirically) — Web Animations API
+// (already used for the wake flash) is the robust way to fade this in/out.
+let greetVisible = false;
+function showGreetingPanel(){
+  if(greetVisible) return; greetVisible = true;
+  greetEl.animate([{opacity:0},{opacity:1}], {duration:350, easing:'ease-out', fill:'forwards'});
 }
+function hideGreetingPanel(){
+  if(!greetVisible) return; greetVisible = false;
+  greetEl.animate([{opacity:1},{opacity:0}], {duration:400, easing:'ease-in', fill:'forwards'});
+}
+
+function showCaption(text, ms){
+  greetEl.textContent = text; showGreetingPanel();
+  clearTimeout(showCaption._t);
+  if(ms) showCaption._t = setTimeout(hideGreetingPanel, ms);
+}
+
+function escapeHtml(s){
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// Reveals text token-by-token on a fixed clock, independent of how the
+// underlying network stream happens to chunk — this is what makes it read as
+// a deliberate robotic typing effect instead of lumpy bursts of text.
+function makeTypewriter(el, wordsPerSec = 13){
+  let buffer = '', queue = [], displayed = '', ended = false, draining = false;
+  function enqueue(text){
+    buffer += text;
+    const parts = buffer.split(/(\s+)/);
+    if(parts.length > 1){
+      const trailingPartial = parts[parts.length - 1];
+      for(const tok of parts.slice(0, -1)) if(tok) queue.push(tok);
+      buffer = trailingPartial;
+    }
+  }
+  async function drain(){
+    if(draining) return; draining = true;
+    while(queue.length){
+      displayed += queue.shift();
+      el.innerHTML = escapeHtml(displayed) + '<span class="cursor"></span>';
+      await new Promise(r=>setTimeout(r, 1000/wordsPerSec));
+    }
+    draining = false;
+    if(ended && !queue.length) el.innerHTML = escapeHtml(displayed);
+  }
+  return {
+    reset(){ buffer=''; queue=[]; displayed=''; ended=false; el.innerHTML=''; },
+    feed(delta){ enqueue(delta); drain(); },
+    end(){ ended = true; if(buffer.trim()) queue.push(buffer); buffer=''; drain(); },
+  };
+}
+const xyroTypewriter = makeTypewriter(greetEl);
 
 async function conversationTurn(userText){
   setState('thinking');
-  showCaption('…', null);
+  xyroTypewriter.reset();
+  showGreetingPanel();
   let firstDelta = true;
   const pipeliner = makeSentencePipeliner((sentence)=>{
     if(awake) speak(sentence); // queued on the bridge — plays in order
   });
-  const full = await askBrainStream(userText, (delta, soFar)=>{
+  const full = await askBrainStream(userText, (delta)=>{
     if(!awake) return;
     if(firstDelta){ firstDelta=false; setState('speaking'); }
-    showCaption(soFar, null); // live caption — grows in real time as the model writes
+    xyroTypewriter.feed(delta); // robotic word-by-word reveal, paced independent of network chunking
     pipeliner.feed(delta);
   });
+  xyroTypewriter.end();
   pipeliner.flush();
   if(!awake) return;
   const words = full.trim().split(/\s+/).length;
   const speakMs = Math.max(1200, Math.min(16000, words*300));
-  setTimeout(()=>{ if(awake){ greetEl.classList.remove('show'); enterListening(); } }, speakMs);
+  setTimeout(()=>{ if(awake){ hideGreetingPanel(); enterListening(); } }, speakMs);
 }
 
 function enterListening(){
@@ -460,7 +530,11 @@ function wake(source){
   flash.animate([{opacity:0},{opacity:.9,offset:.15},{opacity:0}], {duration:1200, easing:'cubic-bezier(.2,.7,.2,1)'});
   setState('listening'); // brief acknowledgement pose while greeting plays
   const line = GREETINGS[greetIdx++ % GREETINGS.length];
-  waketimeout = setTimeout(()=>{ showCaption(line, 3200); speak(line); }, 400);
+  waketimeout = setTimeout(()=>{
+    xyroTypewriter.reset(); showGreetingPanel(); xyroTypewriter.feed(line); xyroTypewriter.end();
+    clearTimeout(showCaption._t); showCaption._t = setTimeout(hideGreetingPanel, 3200);
+    speak(line);
+  }, 400);
   setTimeout(()=>{ waking=false; enterListening(); }, 2600);
 }
 function sleep(){
@@ -469,7 +543,7 @@ function sleep(){
   // dormant still wants the wake-word listener running — don't stop rec here
   recWanted=true; try{ rec && rec.start(); }catch(e){}
   setState('dormant');
-  greetEl.classList.remove('show'); wakePrompt.classList.remove('hidden');
+  hideGreetingPanel(); wakePrompt.classList.remove('hidden');
 }
 
 // click the orb (canvas) to wake — the always-works fallback
@@ -534,16 +608,20 @@ async function initAudio(){
     const an = ac.createAnalyser(); an.fftSize=1024; src.connect(an);
     const buf = new Uint8Array(an.fftSize);
     let prevRms=0, cooldown=0;
-    (function mic(){
+    // setInterval, not requestAnimationFrame: rAF throttles hard in a
+    // background/unfocused tab and shares a queue with the WebGL render loop
+    // — both add up to the "clap doesn't wake it, there's a lag" complaint.
+    // A dedicated timer keeps sampling at a fixed cadence regardless.
+    setInterval(()=>{
       an.getByteTimeDomainData(buf);
       let sum=0; for(let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; sum+=v*v; }
       const rms=Math.sqrt(sum/buf.length);
       cooldown=Math.max(0,cooldown-1);
-      // clap = sharp loud transient after relative quiet
-      if(!awake && cooldown===0 && rms>0.18 && rms-prevRms>0.12){ cooldown=45; wake('clap'); }
+      // clap = sharp loud transient after relative quiet — loosened from the
+      // original threshold, which required an unrealistically hard clap
+      if(!awake && cooldown===0 && rms>0.12 && rms-prevRms>0.06){ cooldown=30; wake('clap'); }
       prevRms=prevRms*0.6+rms*0.4;
-      requestAnimationFrame(mic);
-    })();
+    }, 20);
     document.getElementById('wakeprompt').innerHTML = '👏 clap &nbsp;or&nbsp; 🎙 say “Hello Xyro” &nbsp;to wake<br><span>mic live · or click the orb</span>';
   } catch(e){
     document.getElementById('wakeprompt').innerHTML = '👆 click the orb &nbsp;or&nbsp; press Space &nbsp;to wake<br><span>(enable mic to clap / say “Hello Xyro”)</span>';
@@ -571,10 +649,53 @@ async function initAudio(){
     } catch(e){}
   }
 }
+// Sign-off detection, ported verbatim from src/voice/signoff.ts (pure
+// string/regex logic — same conservative rules as the CLI voice mode).
+// Runs BEFORE the brain is asked anything, so a real goodbye costs zero
+// tokens and — the actual bug being fixed here — ends the conversation
+// instead of re-entering listening forever.
+const SIGNOFFS = ["thank you","thanks","bye","goodbye","good night","goodnight","see you","see ya","catch you later","cheers","got it","gotcha","sounds good","sounds great","will do","perfect","great","cool","okay","ok","alright","all right","nice","awesome","right on","that's all","that is all","we're done","done for now","that's it","noted","later"];
+const SIGNOFF_STRONG = new Set(["thank you","thanks","bye","goodbye","good night","goodnight","see you","see ya","catch you later","cheers","will do","sounds good","sounds great","that's all","that is all","we're done","done for now","got it"]);
+const SIGNOFF_COMMITMENT = /\b(i'?ll|i will|i'?m going to|i am going to|let me)\b/;
+const SIGNOFF_COMMAND_VERBS = /\b(send|create|make|build|run|show|give|check|update|write|fix|open|start|schedule|draft|find|search|tell|explain|analyze|review|remind|add|remove|delete|save|deploy|generate|list|read|play)\b/;
+const SIGNOFF_QUESTION = /\?|(^|\s)(can|could|would|will|what|when|where|who|why|how|is|are|do|does|should|shall)\s+(you|we|the|there)\b|\b(one more thing|how about|what about|another thing|also)\b/;
+const SIGNOFF_FILLERS = new Set(["so","then","for","now","today","tonight","man","really","a","the","that","this","it","its","is","was","and","of","to","i","yeah","yep","fine","good","very","much","do","them","xyro","jarvis","there","everything","all"]);
+function isSignOff(raw, isFirstTurn){
+  if(isFirstTurn) return {end:false, reason:'first turn'};
+  const text = raw.toLowerCase().replace(/[^a-z'? ]+/g,' ').replace(/\s+/g,' ').trim();
+  if(!text) return {end:false, reason:'empty'};
+  const words = text.split(' ');
+  if(words.length > 8) return {end:false, reason:'too long for a goodbye'};
+  if(SIGNOFF_QUESTION.test(text)) return {end:false, reason:'question veto'};
+  const commits = SIGNOFF_COMMITMENT.test(text);
+  if(SIGNOFF_COMMAND_VERBS.test(text) && !commits) return {end:false, reason:'command veto'};
+  const matched = SIGNOFFS.filter(p => new RegExp(`(^|\\s)${p}($|\\s)`).test(text));
+  if(!matched.length) return {end:false, reason:'no sign-off phrase'};
+  const strong = matched.some(p => SIGNOFF_STRONG.has(p)) || commits;
+  if(!strong && words.length > 3) return {end:false, reason:'weak positive in a longer sentence'};
+  let leftover = ` ${text} `;
+  for(const p of [...matched].sort((a,b)=>b.length-a.length)) leftover = leftover.split(` ${p} `).join(' ');
+  leftover = leftover.replace(SIGNOFF_COMMITMENT, ' ');
+  const content = leftover.split(/\s+/).filter(w => w && w !== "'" && !SIGNOFF_FILLERS.has(w));
+  if(content.length >= 2) return {end:false, reason:`continuation veto (${content.join(' ')})`};
+  return {end:true, reason:`sign-off: ${matched.join(', ')}`};
+}
+const SIGNOFF_LINES = ["Going quiet. Ping me when you need me.","Anytime.","Catch you later.","I'll be here."];
+let turnCount = 0;
+
 function finalizeQuery(){
   const text = queryBuffer.trim(); queryBuffer='';
   if(text.length<2) return;
   recWanted=false; try{ rec && rec.stop(); }catch(e){}
+  const verdict = isSignOff(text, turnCount===0);
+  turnCount++;
+  if(verdict.end){
+    const line = SIGNOFF_LINES[Math.floor(Math.random()*SIGNOFF_LINES.length)];
+    xyroTypewriter.reset(); showGreetingPanel(); xyroTypewriter.feed(line); xyroTypewriter.end();
+    speak(line);
+    setTimeout(sleep, 1400); // let the goodbye actually play before going dormant
+    return;
+  }
   conversationTurn(text);
 }
 addEventListener('pointerdown', initAudio, { once:true });
