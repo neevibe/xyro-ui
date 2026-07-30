@@ -260,14 +260,17 @@ const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
 const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight), 0.6, 0.55, 0.72);
 composer.addPass(bloom);
-// vignette
-composer.addPass(new ShaderPass({
-  uniforms:{ tDiffuse:{value:null} },
+// vignette — aspect-corrected so it's a true circle, not a box on wide/tall viewports
+const vignette = new ShaderPass({
+  uniforms:{ tDiffuse:{value:null}, uAspect:{value:innerWidth/innerHeight} },
   vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);}`,
-  fragmentShader:`uniform sampler2D tDiffuse; varying vec2 vUv;
-    void main(){ vec4 c=texture2D(tDiffuse,vUv); float d=distance(vUv,vec2(0.5));
-      c.rgb*=smoothstep(0.95,0.35,d); gl_FragColor=c; }`,
-}));
+  fragmentShader:`uniform sampler2D tDiffuse; uniform float uAspect; varying vec2 vUv;
+    void main(){ vec4 c=texture2D(tDiffuse,vUv);
+      vec2 p=(vUv-0.5); p.x*=max(uAspect,1.0); p.y*=max(1.0/uAspect,1.0); // aspect-correct: circle stays a circle
+      float d=length(p);
+      c.rgb*=smoothstep(0.78,0.28,d); gl_FragColor=c; }`,
+});
+composer.addPass(vignette);
 
 // ---- state machine ----
 const STATES = {
@@ -428,6 +431,7 @@ const clock=new THREE.Clock();
 addEventListener('resize',()=>{
   camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth,innerHeight); composer.setSize(innerWidth,innerHeight);
+  vignette.uniforms.uAspect.value = innerWidth/innerHeight;
 });
 function tick(){
   const dt=clock.getDelta(), t=clock.elapsedTime;
