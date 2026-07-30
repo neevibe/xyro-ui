@@ -33,11 +33,20 @@ const ENGINE = hasEleven ? "elevenlabs" : personalVoiceReady() ? "personal" : "s
 console.log(`XYRO voice bridge → engine: ${ENGINE}`);
 if (ENGINE === "say") console.log("  (train a Personal Voice or set ELEVENLABS keys to speak in your own voice)");
 
-let current = null; // kill in-flight speech when a new line arrives (barge-in)
-function stop() { if (current) { current.kill("SIGKILL"); current = null; } }
+// Sentences within one reply must play SEQUENTIALLY (queued), not interrupt
+// each other — only an explicit /stop (real barge-in) or a new /speak call
+// with `interrupt:true` should cut off in-flight speech.
+let current = null;
+let queue = Promise.resolve();
+function stop() { queue = Promise.resolve(); if (current) { current.kill("SIGKILL"); current = null; } }
 
-async function speak(text) {
-  stop();
+function speak(text) {
+  queue = queue.then(() => speakOne(text)).catch((e) => console.error("speak:", e.message));
+  return queue;
+}
+
+async function speakOne(text) {
+  console.log(`speak › ${text.slice(0, 70)}${text.length > 70 ? "…" : ""}`);
   if (ENGINE === "elevenlabs") {
     const res = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${process.env.ELEVENLABS_VOICE_ID}?output_format=mp3_44100_128`,
@@ -75,9 +84,10 @@ createServer((req, res) => {
     req.on("data", (c) => (body += c));
     req.on("end", async () => {
       try {
-        const { text } = JSON.parse(body || "{}");
+        const { text, interrupt } = JSON.parse(body || "{}");
         if (!text) throw new Error("no text");
-        speak(String(text).slice(0, 600)).catch((e) => console.error("speak:", e.message));
+        if (interrupt) stop();
+        speak(String(text).slice(0, 600));
         res.writeHead(200, { ...CORS, "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, engine: ENGINE }));
       } catch (e) {

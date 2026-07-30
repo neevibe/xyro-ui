@@ -256,9 +256,18 @@ const sg=new THREE.BufferGeometry(); sg.setAttribute('position',new THREE.Buffer
 scene.add(new THREE.Points(sg, new THREE.PointsMaterial({ color:0x6a8bb5, size:0.02, transparent:true, opacity:0.5 })));
 
 // ---- postprocessing: bloom ----
-const composer = new EffectComposer(renderer);
+// Render target must be sized in ACTUAL pixels (CSS size * devicePixelRatio)
+// and multisampled — otherwise on any HiDPI screen the bloom's internal mip
+// chain is built at half the real resolution while the main render is at
+// full res, which shows up as blocky/boxy misalignment that gets worse
+// whenever bloom strength changes (i.e. on every state transition).
+const dpr = renderer.getPixelRatio();
+const rtSize = new THREE.Vector2(innerWidth*dpr, innerHeight*dpr);
+const renderTarget = new THREE.WebGLRenderTarget(rtSize.x, rtSize.y, { samples: 4 });
+const composer = new EffectComposer(renderer, renderTarget);
+composer.setPixelRatio(1); // render target is already in physical pixels
 composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight), 0.6, 0.55, 0.72);
+const bloom = new UnrealBloomPass(rtSize.clone(), 0.6, 0.55, 0.72);
 composer.addPass(bloom);
 // vignette — aspect-corrected so it's a true circle, not a box on wide/tall viewports
 const vignette = new ShaderPass({
@@ -318,16 +327,29 @@ const VOICE_BRIDGE = 'http://localhost:8788';
 const BRAIN_BRIDGE = 'http://localhost:8790';
 let brainUp = false;
 fetch(BRAIN_BRIDGE+'/health').then(r=>r.json()).then(()=>{ brainUp=true; console.log('XYRO brain bridge: up'); }).catch(()=>{});
-async function askBrain(text){
-  const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), 45000);
+// Streams the reply as it's generated (chunked transfer from /ask-stream) so
+// captions update in real time; onDelta also lets the caller pipeline
+// completed sentences to speech instead of waiting for the whole reply.
+async function askBrainStream(text, onDelta){
+  const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), 60000);
+  let full = '';
   try {
-    const r = await fetch(BRAIN_BRIDGE+'/ask', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({text}), signal:ctrl.signal });
-    const d = await r.json(); clearTimeout(t);
-    if(!d.ok) throw new Error(d.error||'brain error');
-    return d.reply;
+    const r = await fetch(BRAIN_BRIDGE+'/ask-stream', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({text}), signal:ctrl.signal });
+    if(!r.ok || !r.body) throw new Error('brain error '+r.status);
+    const reader = r.body.getReader(); const dec = new TextDecoder();
+    while(true){
+      const {done,value} = await reader.read();
+      if(done) break;
+      const delta = dec.decode(value,{stream:true});
+      full += delta; onDelta(delta, full);
+    }
+    clearTimeout(t);
+    return full;
   } catch(e){
     clearTimeout(t);
-    return "Hm — I couldn't reach my brain just now. Is the brain bridge running?";
+    const msg = "Hm — I couldn't reach my brain just now. Is the brain bridge running?";
+    onDelta(msg, msg);
+    return msg;
   }
 }
 let bridgeUp = false;
@@ -345,16 +367,35 @@ function speakBrowser(text){
   } catch(e){}
 }
 // Prefer the local bridge (Neeraj's own Personal Voice); fall back to the
-// browser voice only if the bridge isn't running.
-function speak(text){
-  if(bridgeUp){
-    fetch(VOICE_BRIDGE+'/speak',{ method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({text}) })
-      .catch(()=>speakBrowser(text));
-  } else {
-    fetch(VOICE_BRIDGE+'/speak',{ method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({text}) })
-      .then(r=>{ bridgeUp=true; })
-      .catch(()=>speakBrowser(text));
-  }
+// browser voice only if the bridge isn't running. Sentences queue in order
+// on the bridge side; pass interrupt:true only for a real barge-in.
+function speak(text, interrupt){
+  fetch(VOICE_BRIDGE+'/speak',{ method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({text, interrupt:!!interrupt}) })
+    .then(()=>{ bridgeUp=true; })
+    .catch(()=>{ if(!bridgeUp) speakBrowser(text); });
+}
+function stopSpeaking(){
+  fetch(VOICE_BRIDGE+'/stop',{ method:'POST' }).catch(()=>{});
+}
+
+// Splits streamed text into complete sentences as they finish, so speech can
+// start on sentence 1 while the model is still writing sentence 2+.
+function makeSentencePipeliner(onSentence){
+  let buffer = '';
+  return {
+    feed(delta){
+      buffer += delta;
+      const re = /[^.!?\n]*[.!?\n]+["')\]]*\s*/g;
+      let consumed = 0;
+      for (const m of buffer.matchAll(re)) {
+        const sentence = m[0].trim();
+        if (sentence.length > 1) onSentence(sentence);
+        consumed = m.index + m[0].length;
+      }
+      buffer = buffer.slice(consumed);
+    },
+    flush(){ const rest=buffer.trim(); buffer=''; if(rest) onSentence(rest); },
+  };
 }
 
 let waking=false;
@@ -374,14 +415,21 @@ function showCaption(text, ms){
 
 async function conversationTurn(userText){
   setState('thinking');
-  const reply = await askBrain(userText);
-  if(!awake) return; // went to sleep while thinking
-  setState('speaking');
-  showCaption(reply, null);
-  speak(reply);
-  // rough speaking-duration estimate (bridge doesn't report playback end yet)
-  const words = reply.trim().split(/\s+/).length;
-  const speakMs = Math.max(1400, Math.min(14000, words*340));
+  showCaption('…', null);
+  let firstDelta = true;
+  const pipeliner = makeSentencePipeliner((sentence)=>{
+    if(awake) speak(sentence); // queued on the bridge — plays in order
+  });
+  const full = await askBrainStream(userText, (delta, soFar)=>{
+    if(!awake) return;
+    if(firstDelta){ firstDelta=false; setState('speaking'); }
+    showCaption(soFar, null); // live caption — grows in real time as the model writes
+    pipeliner.feed(delta);
+  });
+  pipeliner.flush();
+  if(!awake) return;
+  const words = full.trim().split(/\s+/).length;
+  const speakMs = Math.max(1200, Math.min(16000, words*300));
   setTimeout(()=>{ if(awake){ greetEl.classList.remove('show'); enterListening(); } }, speakMs);
 }
 
@@ -430,7 +478,10 @@ addEventListener('pointerup',()=>{ cursorEl.style.width='26px'; cursorEl.style.h
 const clock=new THREE.Clock();
 addEventListener('resize',()=>{
   camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth,innerHeight); composer.setSize(innerWidth,innerHeight);
+  renderer.setSize(innerWidth,innerHeight);
+  const dpr=renderer.getPixelRatio();
+  composer.setSize(innerWidth*dpr, innerHeight*dpr);
+  bloom.setSize(innerWidth*dpr, innerHeight*dpr);
   vignette.uniforms.uAspect.value = innerWidth/innerHeight;
 });
 function tick(){
@@ -498,6 +549,7 @@ async function initAudio(){
         }
         if(state!=='listening') return; // ignore stray results while thinking/speaking
         queryBuffer = txt;
+        if(txt) showCaption(txt, null); // live caption of what you're saying, as you say it
         resetSleepTimer();
         clearTimeout(querySilenceTimer);
         querySilenceTimer = setTimeout(finalizeQuery, QUERY_SILENCE_MS);
@@ -521,7 +573,7 @@ setState('dormant'); tick();
 // Debug/test hooks — lets you drive wake/query/sleep without a live mic
 // (devtools: XYRO.wake(), XYRO.say("..."), XYRO.sleep())
 window.XYRO = {
-  wake, sleep, speak, askBrain,
+  wake, sleep, speak, askBrainStream,
   say: (text)=>{ if(!awake) wake('debug'); setTimeout(()=>{ queryBuffer=text; finalizeQuery(); }, awake?0:2700); },
   state: ()=>state, isAwake: ()=>awake,
 };
