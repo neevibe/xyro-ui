@@ -61,19 +61,35 @@
   #hint { position:absolute; bottom:20px; left:50%; transform:translateX(-50%);
     font:300 10px/1 Inter,sans-serif; letter-spacing:.18em; color:rgba(120,150,180,.35);
     text-transform:uppercase; opacity:0; animation:fade 2s 3s forwards; }
-  #greeting { position:fixed; top:50%; right:36px; transform:translateY(-50%);
-    width:min(360px, 34vw); max-height:70vh; overflow-y:auto;
+  /* A real chat transcript, not a single overwritten caption: messages stack
+     and persist so a reply can be reviewed and copied, not just glimpsed. */
+  #transcript { position:fixed; top:50%; right:36px; transform:translateY(-50%);
+    width:min(380px, 36vw); max-height:74vh; overflow-y:auto;
+    display:flex; flex-direction:column; gap:10px;
     font:400 14.5px/1.65 "SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
-    letter-spacing:.01em; color:#c9f3ff; text-align:left; opacity:0;
-    padding:18px 20px; border-radius:14px; pointer-events:none;
+    letter-spacing:.01em; opacity:0; pointer-events:none; }
+  #transcript.show { pointer-events:auto; }
+  #transcript .msg { position:relative; padding:14px 18px; border-radius:14px;
     background:rgba(6,14,20,.55); border:1px solid rgba(120,220,255,.16);
     backdrop-filter:blur(16px); -webkit-backdrop-filter:blur(16px);
-    box-shadow:0 0 40px rgba(0,0,0,.35), inset 0 0 0 1px rgba(255,255,255,.02); }
-  #greeting .cursor { display:inline-block; width:8px; height:15px; margin-left:2px;
+    box-shadow:0 0 24px rgba(0,0,0,.3), inset 0 0 0 1px rgba(255,255,255,.02);
+    animation:msg-in .3s ease-out; }
+  #transcript .msg.xyro { color:#c9f3ff; }
+  #transcript .msg.user { color:rgba(180,215,245,.6); background:rgba(6,14,20,.32);
+    border-color:rgba(120,220,255,.08); font-style:italic; }
+  #transcript .msg.user.draft { opacity:.7; }
+  #transcript .cursor { display:inline-block; width:8px; height:15px; margin-left:2px;
     background:#7ef0ff; vertical-align:-2px; animation:blink 0.9s steps(1) infinite; }
+  #transcript .copy-btn { position:absolute; top:8px; right:10px; opacity:0;
+    font:500 10px/1 -apple-system,Inter,sans-serif; letter-spacing:.08em; text-transform:uppercase;
+    color:rgba(150,220,255,.7); background:rgba(255,255,255,.06); border:1px solid rgba(120,220,255,.2);
+    border-radius:6px; padding:4px 8px; cursor:pointer; transition:opacity .2s, background .2s; }
+  #transcript .msg.xyro:hover .copy-btn { opacity:1; }
+  #transcript .copy-btn:hover { background:rgba(120,220,255,.18); }
+  @keyframes msg-in { from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:translateY(0);} }
   @keyframes blink { 50% { opacity:0; } }
   @media (max-width: 860px) {
-    #greeting { right:50%; transform:translate(50%, -50%); width:min(420px,86vw); }
+    #transcript { right:50%; transform:translate(50%, -50%); width:min(440px,88vw); }
   }
   #wakeprompt { position:absolute; bottom:150px; left:50%; transform:translateX(-50%);
     font:400 13px/1.8 -apple-system,Inter,sans-serif; letter-spacing:.06em; text-align:center;
@@ -106,7 +122,7 @@
     <div class="chip" data-state="speaking">Speaking</div>
   </div>
   <div id="hint">move cursor · orb reacts</div>
-  <div id="greeting"></div>
+  <div id="transcript"></div>
   <div id="wakeprompt">👏 clap &nbsp;or&nbsp; 🎙 say “Hello Xyro” &nbsp;to wake<br><span>(or click the orb)</span></div>
 </div>
 <div id="cursor"></div>
@@ -397,7 +413,7 @@ const GREETINGS = [
 ];
 let greetIdx = Math.floor(performance.now()) % GREETINGS.length;
 const flash = document.createElement('div'); flash.className='flash'; document.body.appendChild(flash);
-const greetEl = document.getElementById('greeting');
+const transcriptEl = document.getElementById('transcript');
 const wakePrompt = document.getElementById('wakeprompt');
 
 const VOICE_BRIDGE = 'http://localhost:8788';
@@ -487,24 +503,81 @@ function resetSleepTimer(){
 // CSS `transition:opacity` on this element proved unreliable at triggering
 // on scripted class changes (verified empirically) — Web Animations API
 // (already used for the wake flash) is the robust way to fade this in/out.
-let greetVisible = false;
-function showGreetingPanel(){
-  if(greetVisible) return; greetVisible = true;
-  greetEl.animate([{opacity:0},{opacity:1}], {duration:350, easing:'ease-out', fill:'forwards'});
-}
-function hideGreetingPanel(){
-  if(!greetVisible) return; greetVisible = false;
-  greetEl.animate([{opacity:1},{opacity:0}], {duration:400, easing:'ease-in', fill:'forwards'});
-}
-
-function showCaption(text, ms){
-  greetEl.textContent = text; showGreetingPanel();
-  clearTimeout(showCaption._t);
-  if(ms) showCaption._t = setTimeout(hideGreetingPanel, ms);
+// The transcript, once shown, stays shown — it's a chat log, not a caption
+// that should vanish after each turn.
+let transcriptVisible = false;
+function showTranscript(){
+  if(transcriptVisible) return; transcriptVisible = true;
+  transcriptEl.classList.add('show');
+  transcriptEl.animate([{opacity:0},{opacity:1}], {duration:350, easing:'ease-out', fill:'forwards'});
 }
 
 function escapeHtml(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function scrollToBottom(){ transcriptEl.scrollTop = transcriptEl.scrollHeight; }
+
+function copyToClipboard(text, btn){
+  navigator.clipboard?.writeText(text).then(()=>{
+    const original = btn.textContent;
+    btn.textContent = 'Copied';
+    setTimeout(()=>{ btn.textContent = original; }, 1200);
+  }).catch(()=>{});
+}
+
+/** Adds a permanent, finalized user-turn bubble (what you actually asked). */
+function addUserMessage(text){
+  const div = document.createElement('div');
+  div.className = 'msg user';
+  div.textContent = text;
+  transcriptEl.appendChild(div);
+  showTranscript(); scrollToBottom();
+  return div;
+}
+
+/** Live, in-progress preview of what you're currently saying — replaced
+ * content each call, never counted as a real turn until finalizeQuery
+ * promotes it (or discards it) via clearDraftCaption/addUserMessage. */
+let draftEl = null;
+function showDraftCaption(text){
+  if(!draftEl){
+    draftEl = document.createElement('div');
+    draftEl.className = 'msg user draft';
+    transcriptEl.appendChild(draftEl);
+    showTranscript();
+  }
+  draftEl.textContent = text;
+  scrollToBottom();
+}
+function clearDraftCaption(){
+  if(draftEl){ draftEl.remove(); draftEl = null; }
+}
+// Kept for the couple of internal-caption call sites — an alias, not a
+// separate concept.
+function showCaption(text, ms){ showDraftCaption(text); }
+
+/** Starts a new, permanent Xyro-turn bubble and returns a typewriter bound
+ * to it — every reply gets its own message instead of overwriting the last. */
+function addXyroMessage(){
+  const div = document.createElement('div');
+  div.className = 'msg xyro';
+  const content = document.createElement('span');
+  content.className = 'msg-content';
+  div.appendChild(content);
+  transcriptEl.appendChild(div);
+  showTranscript(); scrollToBottom();
+  const tw = makeTypewriter(content);
+  const rawEnd = tw.end.bind(tw);
+  tw.end = () => {
+    rawEnd();
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn'; btn.textContent = 'Copy';
+    btn.onclick = (e) => { e.stopPropagation(); copyToClipboard(content.textContent, btn); };
+    div.appendChild(btn);
+    scrollToBottom();
+  };
+  return tw;
 }
 
 // Reveals text token-by-token on a fixed clock, independent of how the
@@ -537,7 +610,7 @@ function makeTypewriter(el, wordsPerSec = 13){
     end(){ ended = true; if(buffer.trim()) queue.push(buffer); buffer=''; drain(); },
   };
 }
-const xyroTypewriter = makeTypewriter(greetEl);
+// (each Xyro turn gets its own typewriter now — see addXyroMessage above)
 
 // Bumped whenever a NEW turn starts (including a barge-in interrupting an
 // old one). A running conversationTurn checks this before every side effect
@@ -549,8 +622,7 @@ async function conversationTurn(userText){
   const myTurn = ++currentTurnId;
   const stale = () => myTurn !== currentTurnId;
   setState('thinking');
-  xyroTypewriter.reset();
-  showGreetingPanel();
+  const tw = addXyroMessage();
   let firstDelta = true;
   const pipeliner = makeSentencePipeliner((sentence)=>{
     if(awake && !stale()) speak(sentence); // queued on the bridge — plays in order
@@ -558,16 +630,16 @@ async function conversationTurn(userText){
   const full = await askBrainStream(userText, (delta)=>{
     if(!awake || stale()) return;
     if(firstDelta){ firstDelta=false; setState('speaking'); }
-    xyroTypewriter.feed(delta); // robotic word-by-word reveal, paced independent of network chunking
+    tw.feed(delta); // robotic word-by-word reveal, paced independent of network chunking
     pipeliner.feed(delta);
   });
   if(stale()) return; // superseded by a barge-in — this turn's work is done
-  xyroTypewriter.end();
+  tw.end();
   pipeliner.flush();
   if(!awake) return;
   const words = full.trim().split(/\s+/).length;
   const speakMs = Math.max(1200, Math.min(16000, words*300));
-  setTimeout(()=>{ if(awake && !stale()){ hideGreetingPanel(); enterListening(); } }, speakMs);
+  setTimeout(()=>{ if(awake && !stale()){ enterListening(); } }, speakMs);
 }
 
 // ---- Local Whisper query transcription ----
@@ -662,8 +734,7 @@ function wake(source, opts){
   }
   const line = GREETINGS[greetIdx++ % GREETINGS.length];
   waketimeout = setTimeout(()=>{
-    xyroTypewriter.reset(); showGreetingPanel(); xyroTypewriter.feed(line); xyroTypewriter.end();
-    clearTimeout(showCaption._t); showCaption._t = setTimeout(hideGreetingPanel, 3200);
+    const tw = addXyroMessage(); tw.feed(line); tw.end();
     speak(line);
   }, 400);
   setTimeout(()=>{ waking=false; enterListening(); }, 2600);
@@ -675,7 +746,8 @@ function sleep(){
   // dormant still wants the wake-word listener running — don't stop rec here
   recWanted=true; try{ rec && rec.start(); }catch(e){}
   setState('dormant');
-  hideGreetingPanel(); wakePrompt.classList.remove('hidden');
+  clearDraftCaption(); wakePrompt.classList.remove('hidden');
+  // the transcript itself stays visible — it's a chat log, not a caption
 }
 
 // click the orb (canvas) to wake — the always-works fallback
@@ -855,7 +927,7 @@ function handleSpeechResult(txt){
     stopSpeaking();
     queryBuffer = '';
     clearTimeout(querySilenceTimer);
-    hideGreetingPanel();
+    clearDraftCaption();
     setState('listening');
     stopQueryRecording(); startQueryRecording(); // discard the stop-phrase's own audio, capture fresh from here
     resetSleepTimer();
@@ -900,15 +972,18 @@ async function finalizeQuery(){
   const whisperText = await transcribeRecordedQuery();
   const text = (whisperText || fallbackText).trim();
   if(text.length<2) return;
+  clearDraftCaption(); // the draft preview is superseded by the finalized message below
   const verdict = isSignOff(text, turnCount===0);
   turnCount++;
   if(verdict.end){
+    addUserMessage(text); // still log what was actually said, even for a goodbye
     const line = SIGNOFF_LINES[Math.floor(Math.random()*SIGNOFF_LINES.length)];
-    xyroTypewriter.reset(); showGreetingPanel(); xyroTypewriter.feed(line); xyroTypewriter.end();
+    const tw = addXyroMessage(); tw.feed(line); tw.end();
     speak(line);
     setTimeout(sleep, 1400); // let the goodbye actually play before going dormant
     return;
   }
+  addUserMessage(text);
   conversationTurn(text);
 }
 addEventListener('pointerdown', initAudio, { once:true });
@@ -920,7 +995,7 @@ setState('dormant'); tick();
 // (devtools: XYRO.wake(), XYRO.say("..."), XYRO.sleep())
 window.XYRO = {
   wake, sleep, speak, askBrainStream, simulateSpeech: handleSpeechResult, setState,
-  say: (text)=>{ if(!awake) wake('debug'); setTimeout(()=>{ queryBuffer=text; finalizeQuery(); }, awake?0:2700); },
+  say: (text)=>{ const wasAwake=awake; if(!awake) wake('debug', {silent:true}); setTimeout(()=>{ queryBuffer=text; finalizeQuery(); }, wasAwake?0:100); },
   state: ()=>state, isAwake: ()=>awake,
 };
 </script>
