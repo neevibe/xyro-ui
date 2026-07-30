@@ -22,10 +22,29 @@ Three.js + custom GLSL shaders (no images, no GIFs):
 - **state machine** — idle (breathing) · listening · thinking · speaking,
   each eased with its own amplitude, speed, color, ring dynamics, and bloom
 
+## Voice bridge
+
+The browser can't reach macOS Personal Voice (Apple restricts it to native
+apps), so XYRO speaks in your own voice through a tiny local server: the page
+POSTs its text, the server synthesizes via the `personal-say` Swift bridge
+(engine chain: ElevenLabs clone → macOS Personal Voice → stock `say`) and
+plays it out the Mac's speakers on the same machine.
+
+```bash
+npm run build:voice   # compile the Personal Voice bridge (once)
+npm run voice         # start the bridge on :8788
+npm run prototype     # serve the orb on :8777
+```
+
+Then open http://localhost:8777 in Chrome, allow the mic, and clap or say
+"Hello Xyro" — it wakes and greets you in your voice.
+
 ## Structure
 
 - `prototype/` — self-contained single-file Three.js prototype of the Core,
-  the locked visual language. Run: `cd prototype && python3 -m http.server 8777`
+  the locked visual language. Run: `npm run prototype`
+- `server/` — the local voice bridge (`voice-server.mjs`) + Personal Voice
+  Swift bridge (`personal-say.swift`)
 - (planned) full **Next.js 15 + React 19 + React Three Fiber** app: ports the
   Core into R3F/drei/postprocessing, adds holographic windows, interface modes,
   voice, and the command center. Connects to the Jarvis brain via API.

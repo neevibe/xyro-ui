@@ -308,7 +308,13 @@ const flash = document.createElement('div'); flash.className='flash'; document.b
 const greetEl = document.getElementById('greeting');
 const wakePrompt = document.getElementById('wakeprompt');
 
-function speak(text){
+const VOICE_BRIDGE = 'http://localhost:8788';
+let bridgeUp = false;
+fetch(VOICE_BRIDGE+'/health').then(r=>r.json()).then(d=>{ bridgeUp=d.ok;
+  if(bridgeUp) console.log('XYRO voice bridge:', d.engine);
+}).catch(()=>{});
+
+function speakBrowser(text){
   try {
     const u = new SpeechSynthesisUtterance(text);
     u.rate = 1.02; u.pitch = 0.92;
@@ -316,6 +322,18 @@ function speak(text){
     u.voice = vs.find(v=>/Daniel|Google UK English Male|Arthur|Oliver/.test(v.name)) || vs.find(v=>/en-GB|en_GB/.test(v.lang)) || vs[0];
     speechSynthesis.cancel(); speechSynthesis.speak(u);
   } catch(e){}
+}
+// Prefer the local bridge (Neeraj's own Personal Voice); fall back to the
+// browser voice only if the bridge isn't running.
+function speak(text){
+  if(bridgeUp){
+    fetch(VOICE_BRIDGE+'/speak',{ method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({text}) })
+      .catch(()=>speakBrowser(text));
+  } else {
+    fetch(VOICE_BRIDGE+'/speak',{ method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({text}) })
+      .then(r=>{ bridgeUp=true; })
+      .catch(()=>speakBrowser(text));
+  }
 }
 
 let waking=false;
