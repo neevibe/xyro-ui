@@ -570,10 +570,74 @@ async function conversationTurn(userText){
   setTimeout(()=>{ if(awake && !stale()){ hideGreetingPanel(); enterListening(); } }, speakMs);
 }
 
+// ---- Local Whisper query transcription ----
+// The browser's built-in speech recognition is a cloud dictation engine of
+// inconsistent accuracy. This records the SAME mic stream continuously
+// while listening and, at the exact moment Web Speech's own silence timer
+// decides the turn is over (that timing is untouched — it isn't what was
+// reported broken), sends the recording to local whisper.cpp via the brain
+// bridge and uses ITS transcript as the authoritative query text. Web
+// Speech's interim results still drive the live "you said" caption — only
+// the text actually sent to the brain changes.
+let queryProcessor=null, queryGain=null, queryChunks=[];
+function startQueryRecording(){
+  if(!micCtx || queryProcessor) return; // no mic yet, or already recording
+  queryChunks = [];
+  queryProcessor = micCtx.createScriptProcessor(2048, 1, 1);
+  queryGain = micCtx.createGain(); queryGain.gain.value = 0; // silent tap — never routed to speakers
+  queryProcessor.onaudioprocess = (e) => queryChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  micSource.connect(queryProcessor);
+  queryProcessor.connect(queryGain);
+  queryGain.connect(micCtx.destination);
+}
+function stopQueryRecording(){
+  if(!queryProcessor) return null;
+  try { micSource.disconnect(queryProcessor); queryProcessor.disconnect(); queryGain.disconnect(); } catch(e){}
+  queryProcessor = null; queryGain = null;
+  const total = queryChunks.reduce((n,b)=>n+b.length,0);
+  if(total < 800) { queryChunks = []; return null; } // too short to be real speech
+  const merged = new Float32Array(total);
+  let off=0; for(const b of queryChunks){ merged.set(b, off); off += b.length; }
+  queryChunks = [];
+  return merged;
+}
+function resampleTo16k(float32, origRate){
+  if(origRate === 16000) return float32;
+  const ratio = origRate/16000, newLen = Math.round(float32.length/ratio);
+  const out = new Float32Array(newLen);
+  for(let i=0;i<newLen;i++){
+    const s = i*ratio, i0 = Math.floor(s), i1 = Math.min(i0+1, float32.length-1), frac = s-i0;
+    out[i] = float32[i0]*(1-frac) + float32[i1]*frac;
+  }
+  return out;
+}
+function encodeWav16k(float32){
+  const pcm = new Int16Array(float32.length);
+  for(let i=0;i<float32.length;i++){ const s=Math.max(-1,Math.min(1,float32[i])); pcm[i] = s<0 ? s*0x8000 : s*0x7FFF; }
+  const header = new ArrayBuffer(44), dv = new DataView(header);
+  const str=(o,s)=>{ for(let i=0;i<s.length;i++) dv.setUint8(o+i, s.charCodeAt(i)); };
+  str(0,'RIFF'); dv.setUint32(4,36+pcm.length*2,true); str(8,'WAVE');
+  str(12,'fmt '); dv.setUint32(16,16,true); dv.setUint16(20,1,true); dv.setUint16(22,1,true);
+  dv.setUint32(24,16000,true); dv.setUint32(28,32000,true); dv.setUint16(32,2,true); dv.setUint16(34,16,true);
+  str(36,'data'); dv.setUint32(40,pcm.length*2,true);
+  return new Blob([header, pcm.buffer], {type:'audio/wav'});
+}
+async function transcribeRecordedQuery(){
+  const raw = stopQueryRecording();
+  if(!raw) return null;
+  try {
+    const wav = encodeWav16k(resampleTo16k(raw, micCtx.sampleRate));
+    const r = await fetch(BRAIN_BRIDGE+'/transcribe', { method:'POST', headers:{'content-type':'audio/wav'}, body: wav });
+    const d = await r.json();
+    return d.ok && d.text && d.text.trim() ? d.text.trim() : null;
+  } catch(e){ console.warn('local transcription failed, falling back to browser STT:', e.message); return null; }
+}
+
 function enterListening(){
   if(!awake) return;
   setState('listening');
   resetSleepTimer();
+  startQueryRecording();
   try { rec && rec.start(); } catch(e){} // already-started errors are harmless
 }
 
@@ -595,6 +659,7 @@ function wake(source){
 function sleep(){
   clearTimeout(sleepTimer); clearTimeout(waketimeout);
   awake=false; waking=false; queryBuffer=''; clearTimeout(querySilenceTimer);
+  stopQueryRecording(); // discard — never transcribed once going dormant
   // dormant still wants the wake-word listener running — don't stop rec here
   recWanted=true; try{ rec && rec.start(); }catch(e){}
   setState('dormant');
@@ -654,6 +719,7 @@ function tick(){
 }
 // ---- MIC: clap transient + "Hello Xyro" wake word (local Web Audio; wake word via Web Speech) ----
 let audioReady=false;
+let micCtx=null, micSource=null; // hoisted so the query recorder (below) can reuse the same mic stream
 async function initAudio(){
   if(audioReady) return; audioReady=true;
   try {
@@ -664,6 +730,7 @@ async function initAudio(){
     const stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:false, noiseSuppression:false, autoGainControl:false } });
     const ac = new (window.AudioContext||window.webkitAudioContext)();
     const src = ac.createMediaStreamSource(stream);
+    micCtx = ac; micSource = src;
     const an = ac.createAnalyser(); an.fftSize=1024; src.connect(an);
     const buf = new Uint8Array(an.fftSize);
     let prevRms=0, cooldown=0;
@@ -755,6 +822,7 @@ function handleSpeechResult(txt){
     clearTimeout(querySilenceTimer);
     hideGreetingPanel();
     setState('listening');
+    stopQueryRecording(); startQueryRecording(); // discard the stop-phrase's own audio, capture fresh from here
     resetSleepTimer();
     return;
   }
@@ -767,6 +835,7 @@ function handleSpeechResult(txt){
     currentTurnId++; // cancels the in-flight reply's remaining side effects
     stopSpeaking();  // clears the queued/current audio on the voice bridge
     setState('listening');
+    startQueryRecording(); // fresh capture for the interrupting utterance
     queryBuffer = txt;
     showCaption(txt, null);
     resetSleepTimer();
@@ -782,10 +851,15 @@ function handleSpeechResult(txt){
   querySilenceTimer = setTimeout(finalizeQuery, QUERY_SILENCE_MS);
 }
 
-function finalizeQuery(){
-  const text = queryBuffer.trim(); queryBuffer='';
-  if(text.length<2) return;
+async function finalizeQuery(){
+  const fallbackText = queryBuffer.trim(); queryBuffer='';
   recWanted=false; try{ rec && rec.stop(); }catch(e){}
+  // Local whisper.cpp transcript of the actual recorded audio is authoritative
+  // when available (far better accuracy); Web Speech's guess is only a
+  // fallback if local transcription is unavailable/failed.
+  const whisperText = await transcribeRecordedQuery();
+  const text = (whisperText || fallbackText).trim();
+  if(text.length<2) return;
   const verdict = isSignOff(text, turnCount===0);
   turnCount++;
   if(verdict.end){
