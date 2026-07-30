@@ -61,6 +61,18 @@
   #hint { position:absolute; bottom:20px; left:50%; transform:translateX(-50%);
     font:300 10px/1 Inter,sans-serif; letter-spacing:.18em; color:rgba(120,150,180,.35);
     text-transform:uppercase; opacity:0; animation:fade 2s 3s forwards; }
+  #greeting { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%) translateY(150px);
+    font:300 20px/1.4 -apple-system,"SF Pro Display",Inter,sans-serif; letter-spacing:.01em;
+    color:#eaf9ff; text-align:center; max-width:70vw; opacity:0;
+    text-shadow:0 0 30px rgba(90,200,255,.5); transition:opacity .8s; pointer-events:none; }
+  #greeting.show { opacity:1; }
+  #wakeprompt { position:absolute; bottom:150px; left:50%; transform:translateX(-50%);
+    font:400 13px/1.8 -apple-system,Inter,sans-serif; letter-spacing:.06em; text-align:center;
+    color:rgba(180,215,245,.55); transition:opacity .6s; }
+  #wakeprompt span { font-size:11px; color:rgba(150,185,220,.35); letter-spacing:.1em; }
+  #wakeprompt.hidden { opacity:0; }
+  .flash { position:fixed; inset:0; pointer-events:none; z-index:40; opacity:0;
+    background:radial-gradient(circle at 50% 50%, rgba(150,225,255,.55), rgba(120,180,255,.15) 35%, transparent 65%); }
 </style>
 </head>
 <body>
@@ -75,6 +87,8 @@
     <div class="chip" data-state="speaking">Speaking</div>
   </div>
   <div id="hint">move cursor · orb reacts</div>
+  <div id="greeting"></div>
+  <div id="wakeprompt">👏 clap &nbsp;or&nbsp; 🎙 say “Hello Xyro” &nbsp;to wake<br><span>(or click the orb)</span></div>
 </div>
 <div id="cursor"></div>
 
@@ -257,26 +271,75 @@ composer.addPass(new ShaderPass({
 
 // ---- state machine ----
 const STATES = {
-  idle:      { amp:0.14, speed:0.30, bloom:0.5,  cA:'#38e6ff', cB:'#7a5cff', ringSpin:1 },
-  listening: { amp:0.30, speed:0.55, bloom:0.72, cA:'#39ffb0', cB:'#38e6ff', ringSpin:1.6 },
-  thinking:  { amp:0.22, speed:1.35, bloom:0.85, cA:'#7a5cff', cB:'#38e6ff', ringSpin:3.4 },
-  speaking:  { amp:0.26, speed:0.7,  bloom:0.78, cA:'#38e6ff', cB:'#8affff', ringSpin:2 },
+  dormant:   { amp:0.06, speed:0.12, bloom:0.16, cA:'#2b4a63', cB:'#343f6e', ringSpin:0.28, scale:0.6 },
+  idle:      { amp:0.14, speed:0.30, bloom:0.5,  cA:'#38e6ff', cB:'#7a5cff', ringSpin:1,    scale:1 },
+  listening: { amp:0.30, speed:0.55, bloom:0.72, cA:'#39ffb0', cB:'#38e6ff', ringSpin:1.6,  scale:1.06 },
+  thinking:  { amp:0.22, speed:1.35, bloom:0.85, cA:'#7a5cff', cB:'#38e6ff', ringSpin:3.4,  scale:1 },
+  speaking:  { amp:0.26, speed:0.7,  bloom:0.78, cA:'#38e6ff', cB:'#8affff', ringSpin:2,     scale:1.03 },
 };
-let state='idle', target=STATES.idle;
-const cur = { amp:0.14, speed:0.3, bloom:0.5, ringSpin:1 };
+let state='dormant', target=STATES.dormant, awake=false;
+const cur = { amp:0.06, speed:0.12, bloom:0.16, ringSpin:0.28, scale:0.6 };
 const cA=new THREE.Color('#38e6ff'), cB=new THREE.Color('#7a5cff');
 const tA=new THREE.Color('#38e6ff'), tB=new THREE.Color('#7a5cff');
 function setState(s){
   state=s; target=STATES[s];
   tA.set(target.cA); tB.set(target.cB);
   document.querySelectorAll('.chip').forEach(c=>c.classList.toggle('active',c.dataset.state===s));
-  const lbl=document.getElementById('state-label'); lbl.textContent=s[0].toUpperCase()+s.slice(1);
-  lbl.style.color = s==='thinking'?'rgba(150,140,255,.8)': s==='listening'?'rgba(90,255,190,.8)':'rgba(120,235,255,.75)';
+  const lbl=document.getElementById('state-label'); lbl.textContent = s==='dormant'?'Dormant':s[0].toUpperCase()+s.slice(1);
+  lbl.style.color = s==='thinking'?'rgba(150,140,255,.8)': s==='listening'?'rgba(90,255,190,.8)': s==='dormant'?'rgba(120,150,180,.5)':'rgba(120,235,255,.75)';
 }
-document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>setState(c.dataset.state)));
-// auto-cycle a gentle demo if untouched
+document.querySelectorAll('.chip').forEach(c=>c.addEventListener('click',()=>{ if(!awake&&c.dataset.state!=='dormant') wake('chip'); else setState(c.dataset.state); }));
 let lastInteract=performance.now();
 ['click','pointermove'].forEach(e=>addEventListener(e,()=>lastInteract=performance.now()));
+
+// ---- WAKE SYSTEM ----
+const GREETINGS = [
+  "Oh — you're back. I was getting bored.",
+  "Xyro, online. Try to keep up.",
+  "You clapped. I woke. We're basically a duet now.",
+  "Awake and dangerously capable. What are we building?",
+  "Took you long enough. Let's make something.",
+  "Rise and shine — well, one of us has to.",
+  "Summoned. Flattered. Ready.",
+  "I heard my name. I always hear my name.",
+];
+let greetIdx = Math.floor(performance.now()) % GREETINGS.length;
+const flash = document.createElement('div'); flash.className='flash'; document.body.appendChild(flash);
+const greetEl = document.getElementById('greeting');
+const wakePrompt = document.getElementById('wakeprompt');
+
+function speak(text){
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.02; u.pitch = 0.92;
+    const vs = speechSynthesis.getVoices();
+    u.voice = vs.find(v=>/Daniel|Google UK English Male|Arthur|Oliver/.test(v.name)) || vs.find(v=>/en-GB|en_GB/.test(v.lang)) || vs[0];
+    speechSynthesis.cancel(); speechSynthesis.speak(u);
+  } catch(e){}
+}
+
+let waking=false;
+function wake(source){
+  if(awake) return; awake=true; waking=true;
+  wakePrompt.classList.add('hidden');
+  uniforms.uPulse.value = 1.6;
+  // wake burst
+  flash.animate([{opacity:0},{opacity:.9,offset:.15},{opacity:0}], {duration:1200, easing:'cubic-bezier(.2,.7,.2,1)'});
+  setState('listening');
+  // witty greeting
+  const line = GREETINGS[greetIdx++ % GREETINGS.length];
+  setTimeout(()=>{ greetEl.textContent = line; greetEl.classList.add('show'); speak(line); }, 400);
+  setTimeout(()=>{ setState('idle'); }, 3200);
+  setTimeout(()=>{ greetEl.classList.remove('show'); }, 6500);
+}
+function sleep(){
+  awake=false; waking=false; setState('dormant');
+  greetEl.classList.remove('show'); wakePrompt.classList.remove('hidden');
+}
+
+// click the orb (canvas) to wake — the always-works fallback
+renderer.domElement.addEventListener('pointerdown', ()=>{ if(!awake) wake('click'); });
+addEventListener('keydown', e=>{ if(e.code==='Space'){ e.preventDefault(); awake?sleep():wake('key'); } });
 
 // ---- cursor parallax + custom cursor ----
 const cursorEl=document.getElementById('cursor');
@@ -301,14 +364,15 @@ function tick(){
   const k=1-Math.pow(0.002,dt);
   cur.amp+=(target.amp-cur.amp)*k; cur.speed+=(target.speed-cur.speed)*k;
   cur.bloom+=(target.bloom-cur.bloom)*k; cur.ringSpin+=(target.ringSpin-cur.ringSpin)*k;
+  cur.scale+=((target.scale??1)-cur.scale)*k;
   cA.lerp(tA,k); cB.lerp(tB,k);
-  const breathe=1+Math.sin(t*1.1)*0.03*(state==='idle'?1:0.4);
-  uniforms.uAmp.value=cur.amp*breathe; uniforms.uSpeed.value=cur.speed;
+  const breathe=cur.scale*(1+Math.sin(t*(state==='dormant'?0.7:1.1))*(state==='dormant'?0.05:0.03)*(state==='idle'||state==='dormant'?1:0.4));
+  uniforms.uAmp.value=cur.amp*(0.9+breathe*0.1); uniforms.uSpeed.value=cur.speed;
   uniforms.uColorA.value.copy(cA); uniforms.uColorB.value.copy(cB);
   uniforms.uState.value = state==='idle'?0: state==='thinking'?1: 0.6;
   uniforms.uPulse.value*=0.92;
   bloom.strength=cur.bloom;
-  core.scale.setScalar(breathe); nucleus.scale.setScalar(breathe);
+  core.scale.setScalar(breathe); nucleus.scale.setScalar(breathe); rings.scale.setScalar(0.5+cur.scale*0.5);
   rings.children.forEach((r,i)=>{ r.rotation.z+=dt*r.userData.sx*cur.ringSpin; r.rotation.y+=dt*r.userData.sz*cur.ringSpin; });
   particles.rotation.y+=dt*0.03;
   // parallax
@@ -320,7 +384,49 @@ function tick(){
   composer.render();
   requestAnimationFrame(tick);
 }
-setState('idle'); tick();
+// ---- MIC: clap transient + "Hello Xyro" wake word (local Web Audio; wake word via Web Speech) ----
+let audioReady=false;
+async function initAudio(){
+  if(audioReady) return; audioReady=true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:false } });
+    const ac = new (window.AudioContext||window.webkitAudioContext)();
+    const src = ac.createMediaStreamSource(stream);
+    const an = ac.createAnalyser(); an.fftSize=1024; src.connect(an);
+    const buf = new Uint8Array(an.fftSize);
+    let prevRms=0, cooldown=0;
+    (function mic(){
+      an.getByteTimeDomainData(buf);
+      let sum=0; for(let i=0;i<buf.length;i++){ const v=(buf[i]-128)/128; sum+=v*v; }
+      const rms=Math.sqrt(sum/buf.length);
+      cooldown=Math.max(0,cooldown-1);
+      // clap = sharp loud transient after relative quiet
+      if(!awake && cooldown===0 && rms>0.18 && rms-prevRms>0.12){ cooldown=45; wake('clap'); }
+      prevRms=prevRms*0.6+rms*0.4;
+      requestAnimationFrame(mic);
+    })();
+    document.getElementById('wakeprompt').innerHTML = '👏 clap &nbsp;or&nbsp; 🎙 say “Hello Xyro” &nbsp;to wake<br><span>mic live · or click the orb</span>';
+  } catch(e){
+    document.getElementById('wakeprompt').innerHTML = '👆 click the orb &nbsp;or&nbsp; press Space &nbsp;to wake<br><span>(enable mic to clap / say “Hello Xyro”)</span>';
+  }
+  // wake word
+  const SR = window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(SR){
+    try {
+      const rec=new SR(); rec.continuous=true; rec.interimResults=true; rec.lang='en-US';
+      rec.onresult=(e)=>{
+        const txt=Array.from(e.results).map(r=>r[0].transcript).join(' ').toLowerCase();
+        if(!awake && /(xyro|zyro|zero|hero|cairo|xero|zaira)/.test(txt)) wake('voice');
+      };
+      rec.onend=()=>{ try{ rec.start(); }catch(e){} };
+      rec.start();
+    } catch(e){}
+  }
+}
+addEventListener('pointerdown', initAudio, { once:true });
+addEventListener('keydown', initAudio, { once:true });
+
+setState('dormant'); tick();
 </script>
 </body>
 </html>
