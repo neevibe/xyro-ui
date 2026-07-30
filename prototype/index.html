@@ -760,7 +760,11 @@ async function initAudio(){
   if(SR){
     try {
       rec=new SR(); rec.continuous=true; rec.interimResults=true; rec.lang='en-US';
-      rec.onresult=(e)=>handleSpeechResult(Array.from(e.results).map(r=>r[0].transcript).join(' ').trim());
+      // Only the LATEST result entry, not all of them joined — continuous
+      // mode accumulates every utterance since recognition started, and
+      // joining them all meant longer sessions kept gluing more and more of
+      // the conversation history into "what you just said".
+      rec.onresult=(e)=>handleSpeechResult(e.results[e.results.length-1][0].transcript.trim());
       rec.onend=()=>{ if(recWanted){ try{ rec.start(); }catch(e){} } };
       rec.start();
     } catch(e){}
@@ -853,7 +857,12 @@ function handleSpeechResult(txt){
 
 async function finalizeQuery(){
   const fallbackText = queryBuffer.trim(); queryBuffer='';
-  recWanted=false; try{ rec && rec.stop(); }catch(e){}
+  // Deliberately NOT stopping recognition here anymore: it used to be
+  // stopped-then-restarted per turn, but nothing reliably turned it back on
+  // except going fully to sleep — recognition (and therefore barge-in, which
+  // depends on it running during thinking/speaking) silently died after the
+  // first completed turn. It now runs continuously from wake to sleep;
+  // reading only the latest result entry (above) keeps that safe.
   // Local whisper.cpp transcript of the actual recorded audio is authoritative
   // when available (far better accuracy); Web Speech's guess is only a
   // fallback if local transcription is unavailable/failed.
