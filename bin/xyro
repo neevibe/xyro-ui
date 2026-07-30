@@ -1,0 +1,66 @@
+#!/bin/bash
+# XYRO service control — install/start/stop/status/logs for the always-on
+# background services (face, voice, brain), run via macOS launchd.
+set -e
+AGENTS_DIR="$HOME/Library/LaunchAgents"
+SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../launchd" && pwd)"
+SERVICES=(com.xyro.face com.xyro.voice com.xyro.brain)
+
+install() {
+  mkdir -p "$AGENTS_DIR" "$HOME/Library/Logs/xyro"
+  for svc in "${SERVICES[@]}"; do
+    cp "$SRC_DIR/$svc.plist" "$AGENTS_DIR/$svc.plist"
+  done
+  echo "Installed plists to $AGENTS_DIR"
+  start
+}
+
+start() {
+  for svc in "${SERVICES[@]}"; do
+    launchctl bootstrap "gui/$(id -u)" "$AGENTS_DIR/$svc.plist" 2>/dev/null \
+      || launchctl load "$AGENTS_DIR/$svc.plist" 2>/dev/null || true
+  done
+  echo "Started. Open http://localhost:8777"
+}
+
+stop() {
+  for svc in "${SERVICES[@]}"; do
+    launchctl bootout "gui/$(id -u)/$svc" 2>/dev/null \
+      || launchctl unload "$AGENTS_DIR/$svc.plist" 2>/dev/null || true
+  done
+  echo "Stopped."
+}
+
+status() {
+  for svc in "${SERVICES[@]}"; do
+    if launchctl list | grep -q "$svc"; then
+      line=$(launchctl list | grep "$svc")
+      echo "✓ $svc  ($line)"
+    else
+      echo "✗ $svc  (not running)"
+    fi
+  done
+  echo ""
+  for port_name in "8777:face" "8788:voice" "8790:brain"; do
+    port="${port_name%%:*}"; name="${port_name##*:}"
+    if curl -sf -m 2 "http://localhost:$port/health" >/dev/null 2>&1 || curl -sf -m 2 "http://localhost:$port/" >/dev/null 2>&1; then
+      echo "✓ $name responding on :$port"
+    else
+      echo "✗ $name NOT responding on :$port"
+    fi
+  done
+}
+
+logs() {
+  tail -f "$HOME/Library/Logs/xyro/"*.log
+}
+
+case "$1" in
+  install) install ;;
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  status) status ;;
+  logs) logs ;;
+  *) echo "usage: xyro {install|start|stop|restart|status|logs}"; exit 1 ;;
+esac

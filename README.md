@@ -39,6 +39,22 @@ npm run prototype     # serve the orb on :8777
 Then open http://localhost:8777 in Chrome, allow the mic, and clap or say
 "Hello Xyro" — it wakes and greets you in your voice.
 
+## Always-on (launchd)
+
+For daily use, run all three as background services that auto-start at login
+and auto-restart if they crash — no terminals to keep open:
+
+```bash
+bin/xyro install   # one-time: installs + starts the launchd services
+bin/xyro status     # check what's running
+bin/xyro logs       # tail all three logs
+bin/xyro restart    # e.g. after pulling code changes
+bin/xyro stop       # take it down
+```
+
+Logs land in `~/Library/Logs/xyro/`. The plists live in `launchd/` (templates)
+and get copied to `~/Library/LaunchAgents/` on install.
+
 ## Structure
 
 - `prototype/` — self-contained single-file Three.js prototype of the Core,
